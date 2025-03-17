@@ -250,7 +250,7 @@ template <uint32_t num_warps_q, uint32_t num_warps_k,
 __device__ __forceinline__ void compute_int_qk(const smem_t<swizzle_mode, stride> &smem_Q, const smem_t<swizzle_mode, stride> &smem_K, int32_t RS[][num_tiles_k][8], uint32_t &offset_Q, uint32_t &offset_K)
 {
   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4);
-
+  // 局部寄存器数组
   uint32_t RQ[num_tiles_q][4];
   uint32_t RK[4];
 

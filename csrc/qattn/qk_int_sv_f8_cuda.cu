@@ -28,9 +28,18 @@
 
 #include "attn_utils.cuh"
 
+// 这些定义可能与硬件加速（如Tensor Core）的内存对齐和计算单元打包有关，决定了数据如何被高效加载和处理
 #define PACK_SIZE_QK 16 // as if it is int8
 #define PACK_SIZE_V 16  // fp8
 #define PACK_SIZE_O 8   // fp16
+// 定义了Q和K之间矩阵乘法的维度（基于Tensor Core的int8计算）：
+// MMA_QK_M: 输出矩阵的行数（16）。
+
+// MMA_QK_N: 输出矩阵的列数（16）。
+
+// MMA_QK_K: 共享维度（32），即Q的列数和K的行数。
+
+// 作用: 这指定了Tensor Core在计算Q和K的点积时的块大小。
 
 // treat as if int8 tensor core
 #define MMA_QK_M 16
@@ -41,10 +50,13 @@
 #define MMA_SV_M 16
 #define MMA_SV_N 16
 #define MMA_SV_K 32
+// mask_mode: 掩码模式（如因果掩码，用于自回归模型），默认无掩码。
 
+// fuse_v_scale: 是否将V的缩放操作融合到计算中，以减少访存
 template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint32_t head_dim, DataType DTypeQK, QuantGranularity Q_GRAN, QuantGranularity K_GRAN,
         typename DTypeSVAccum = float, bool use_inst_buffer = false, PVThresholdMode pv_threashold_mode, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool fuse_v_scale=false, bool return_pv_count = false>
 __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V, DTypeOut *__restrict__ O, int32_t *__restrict__ PV_Count, int32_t *__restrict__ Lut, int32_t *__restrict__ Valid_Block_Num, float *__restrict__ PV_Threshold,
+                      // Q、K、V的量化缩放因子，用于将int8/fp8转换回浮点数。
                       float *__restrict__ Q_scale, float *__restrict__ K_scale, float *__restrict__ V_scale,
                       const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
                       const uint32_t stride_bz_q, const uint32_t stride_seq_q, const uint32_t stride_h_q, 
@@ -55,22 +67,104 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
 {
   // compile time check
   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4, "DTypeQK must be int8 or int4");
+  // Q_GRAN和K_GRAN是Q和K量化的“粒度”，只能是“每个线程块（block）”、“每个线程束（warp）”或者“每个线程（thread）”之一。
   static_assert(Q_GRAN == QuantGranularity::kPerBlock || Q_GRAN == QuantGranularity::kPerWarp || Q_GRAN == QuantGranularity::kPerThread, "Q_GRAN must be kPerBlock, kPerWarp or kPerThread");
   static_assert(K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp || K_GRAN == QuantGranularity::kPerThread, "K_GRAN must be kPerBlock, kPerWarp or kPerThread");
   static_assert(head_dim % 64 == 0, "head_dim must be a multiple of 64");
+//   意思：DTypeSVAccum是计算S和V（Softmax后的权重和值）时的累加器类型，必须是float（32位浮点数），half（16位浮点数）还在开发中（WIP = Work In Progress）。  
+// 为什么？float精度更高，避免累加时的误差，half虽然省内存但还没调好。
   static_assert(std::is_same<DTypeSVAccum, float>::value, "DTypeSVAccum must be float, half is WIP");
   static_assert(std::is_same<DTypeOut, half>::value || std::is_same<DTypeOut, nv_bfloat16>::value, "DTypeOut must be half or nv_bfloat16");
   static_assert(CTA_K % 64 == 0);
-  static_assert(CTA_Q / CTA_K <= 2); // for efficient causal implementation
+//   第一步：CTA_Q 和 CTA_K 是什么？
+// 在 CUDA 中，"CTA" 表示协作线程数组（Cooperative Thread Array），也就是一个线程块。这里：
+// CTA_Q：线程块处理的查询（Query，简称 Q）元素数量。
 
+// CTA_K：线程块处理的关键（Key，简称 K）元素数量
+// 注意力计算
+// 这个内核实现的是块稀疏注意力机制：
+// 查询-关键点积：使用 int8 整数运算（借助 Tensor Core）计算查询 (Q) 和关键 (K) 的分数。
+// cpp
+
+// compute_int_qk<...>(smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
+
+// RS 保存了一块 Q 和 K 的结果分数。
+
+// 因果掩码：如果启用了因果性，应用掩码阻止关注未来的关键。
+
+// Softmax 和值计算：归一化分数并用值 (V) 计算输出。
+
+// 数据按瓦片（tile）处理：
+// num_tiles_q = WARP_Q / MMA_QK_M = 32 / 16 = 2（每个线程束的查询瓦片数）。
+
+// num_tiles_k = WARP_K / MMA_QK_N = 64 / 16 = 4（每个线程束的关键瓦片数）。
+
+// 每个线程块有：
+// num_warps_q = CTA_Q / WARP_Q = 128 / 32 = 4 个线程束处理查询。
+
+// num_warps_k = CTA_K / WARP_K = 64 / 64 = 1 个线程束处理关键。
+
+// 总线程束数 = num_warps_q * num_warps_k = 4。
+
+// 因果掩码的效率
+// 在因果注意力中，位置 i 的查询只能关注位置 j <= i 的关键。内核一次处理 CTA_Q 个查询和 CTA_K 个关键，掩码按块应用。索引计算如下：
+// cpp
+
+// uint32_t Q_idx_lane_base = bx * CTA_Q + get_warp_idx_q<...>() * WARP_Q + lane_id / 4;
+// uint32_t K_idx_lane_base = get_warp_idx_k<...>() * WARP_K + 2 * (lane_id % 4);
+
+// bx 是查询维度的块索引。
+
+// Q_idx_lane_base 和 K_idx_lane_base 确定查询和关键块的起始位置。
+
+// 对于块索引 bx，查询范围是 bx * CTA_Q 到 (bx + 1) * CTA_Q - 1（如 bx = 0 时为 0–127）。关键由 Lut 定义的稀疏集合提供，通常跨 CTA_K 个元素（第一次迭代可能是 0–63）。
+// 在因果场景中：
+// 早期的查询（0–63）只能看到它们位置之前的键。
+
+// 后期的查询（64–127）可以看到更多键，但不超过自己的位置。
+
+// 如果 CTA_Q 相对于 CTA_K 太大，块内的查询可能需要关注序列中更早的关键，而当前 CTA_K 并未覆盖这些关键。这可能导致低效的内存访问或需要更多迭代来获取早期关键，尤其是在稀疏注意力中，Lut 决定了哪些关键块是相关的。
+// 为什么是 2？
+// 当 CTA_Q / CTA_K = 2：
+// 查询 0–127 与关键 0–63 配对。
+
+// 对于因果性，查询 64–127 不应看到超过 127 的关键，但可以关注它们自己的位置。
+
+// 如果 CTA_Q / CTA_K > 2（如 CTA_Q = 192，CTA_K = 64，比例 = 3）：
+// 查询 0–191 与关键 0–63 配对。
+
+// 查询 128–191 需要关键直到 191，但只加载了 0–63，可能错过 64–191，除非 Lut 通过更多迭代补偿。
+
+// 比例 ≤ 2 确保查询块不会比关键块超前太多，使因果掩码应用保持高效。它平衡了工作负载，使得：
+// 线程块的关键范围与查询的因果需求合理对齐。
+
+// 共享内存使用（smem_Q 和 smem_K）和线程束并行性保持优化。
+
+// 第四步：效率影响
+// 共享内存：内核为 Q、K 和 V 使用共享内存：
+// cpp
+
+// size_t smem_max = std::max(CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t), CTA_Q * HEAD_DIM * sizeof(half));
+
+// 更大的 CTA_Q 增加内存压力，但保持 ≤ 2 * CTA_K 确保可控。
+
+// 线程束利用率：4 个线程束（128 / 32）处理查询，每个 32 个；1 个线程束处理 64 个关键，比例支持 Tensor Core 的高效 MMA 操作。
+
+// 因果掩码开销：小的比例减少了被掩码掉的无效计算，因为关键块与查询的因果需求紧密匹配。
+  static_assert(CTA_Q / CTA_K <= 2); // for efficient causal implementation
+// WARP_Q 是每个线程束处理的查询元素数
+/// TODO: 这里是在做warp specialization吗？不是的，只是说一个warp要完成多少的Q的任务，多少的K的任务，然后排列组合一下，得到总的warp数量
   constexpr uint32_t num_warps_q = CTA_Q / WARP_Q;
   constexpr uint32_t num_warps_k = CTA_K / WARP_K;
   constexpr uint32_t num_warps = num_warps_q * num_warps_k;
+// 每个线程束要处理的小矩阵乘法，再分成小块（tile），交给Tensor Core算矩阵乘法，看看要多少次tensor core的使用
   constexpr uint32_t num_tiles_q = WARP_Q / MMA_QK_M;
   constexpr uint32_t num_tiles_k = WARP_K / MMA_QK_N;
+  // 如果是int4：瓦片数 = head_dim ÷ 2 ÷ 32（因为int4比int8数据量少一半），目前理解是tensorcore有块存储，int4更小，所以存的更多，需要更少的瓦片数
   constexpr uint32_t num_tiles_qk_inner = (DTypeQK == DataType::kInt8) ? (head_dim / MMA_QK_K) : (head_dim / 2 / MMA_QK_K);
   constexpr uint32_t num_tiles_v = head_dim / MMA_SV_N;
-
+// 直白说：这些是内存布局的“跨度”，告诉GPU怎么读写共享内存
+// QK_SMEM_STRIDE: Q和K在共享内存中的步幅（一行多长）
   constexpr uint32_t QK_SMEM_STRIDE = (DTypeQK == DataType::kInt8) ? (head_dim) : (head_dim / 2);
   constexpr uint32_t O_SMEM_STRIDE = head_dim;
   //                       for fp16: head_dim
@@ -92,14 +186,19 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
 
   float pv_threshold;
   int pv_count = 0;
-
+  // PV不是肯定要稀疏的吗，然后一个head定一个threshold
   if constexpr (pv_threashold_mode != PVThresholdMode::kNone)
   {
     pv_threshold = PV_Threshold[head_id];
   }
 
   // RS holds the fragment of S
+//   最后的 [8] 和 [2]：
+// 这是 Tensor Core 的输出分片大小，8 表示每次 MMA（矩阵乘法累加）操作输出 8 个元素（因为用的是 16×16×32 的矩阵块）。
+// 2 是因为每个瓦片分成 2 个子块处理（与线程束的 32 个线程分配有关）
+  // 存Softmax前的注意力分数（Q·K^T的片段），维度是[Q瓦片数][K瓦片数][8]，用int32_t存。
   int32_t RS[num_tiles_q][num_tiles_k][8];
+  // 存输出O的中间结果（S·V的片段），维度是[Q瓦片数][V瓦片数][8]，类型是DTypeSVAccum（默认float）
   DTypeSVAccum RO[num_tiles_q][num_tiles_v][8];
   float m[num_tiles_q][2]; // max
   float d[num_tiles_q][2]; // denominator
@@ -140,7 +239,15 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
 
   constexpr uint32_t k_scale_advance_offset = (K_GRAN == QuantGranularity::kPerBlock) ? 1 : (K_GRAN == QuantGranularity::kPerWarp) ? (CTA_K / WARP_K) : (CTA_K / WARP_K) * 4;
 
-  // initialize o, m, d
+  // initialize o, m, d初始化RO（输出中间结果）：
+// 如果DTypeSVAccum是float：每个元素设为0.0。
+
+// 如果是half：用int32_t清零（因为half占16位，两个half塞进一个int32_t，所以循环到4）。
+
+// 初始化m和d（Softmax辅助数组）：
+// m设为一个很小的值（-5000000.0），表示当前最大值初始为“负无穷”。
+
+// d设为1.0，表示分母初始为1
 #pragma unroll
   for (uint32_t fq = 0; fq < num_tiles_q; fq++)
   {
@@ -175,19 +282,36 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
       d[fq][k] = 1.0f;
     }
   }
+  // 共享内存是一个线程块内共用的“工作台”，Q、K、V的数据要分开放。
 
+  // Q从头开始（偏移0），K紧跟在Q后面，V再跟在K后面，靠偏移量分开。
+  
+  // 直白说：就像在桌子上划区域，Q放左边，K放中间，V放右边，CTA_Q和CTA_K是每块区域的宽度
   constexpr uint32_t K_smem_idx_offset = CTA_Q;
   constexpr uint32_t V_smem_idx_offset = CTA_Q + CTA_K;
 
+  //  通过打乱数据存放顺序（比如按32字节、64字节、128字节为单位重新排列），减少线程间的“银行冲突”（bank conflict）
   constexpr SwizzleMode swizzle_mode_QK = (QK_SMEM_STRIDE == 32) ? SwizzleMode::k32B : (QK_SMEM_STRIDE == 64) ? SwizzleMode::k64B : SwizzleMode::k128B;
   smem_t<swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK> smem_Q(smem);
   smem_t<swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK> smem_K(smem + K_smem_idx_offset * QK_SMEM_STRIDE);
   //                                             for fp16: 32
   constexpr SwizzleMode swizzle_mode_V = (V_SMEM_STRIDE == 64) ? SwizzleMode::k64B : SwizzleMode::k128B;
   smem_t<swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V> smem_V(smem + V_smem_idx_offset * QK_SMEM_STRIDE);
+
+  // smem_O：输出的共享内存，从smem开头（可能后面覆盖Q）。
   constexpr SwizzleMode swizzle_mode_O = (O_SMEM_STRIDE == 32) ? SwizzleMode::k64B : SwizzleMode::k128B;
   smem_t<swizzle_mode_O, O_SMEM_STRIDE / PACK_SIZE_O> smem_O(smem);
 
+  // global_to_shared_line_lanes_*：每行数据分给几个线程（lane）去加载。
+
+  // global_to_shared_copy_lines_per_warp_*：每个线程束（warp）负责加载几行。
+  
+  // 根据步幅大小调整：
+  // QK：步幅32时2线程/行，16行/warp；64时4线程/行，8行/warp；其他8线程/行，4行/warp。
+  
+  // V：步幅64时4线程/行，8行/warp；其他8线程/行，4行/warp。
+  
+  // O：步幅32时4线程/行，8行/warp；其他8线程/行，4行/warp。
   constexpr uint32_t global_to_shared_line_lanes_QK = (QK_SMEM_STRIDE == 32) ? 2 : (QK_SMEM_STRIDE == 64) ? 4 : 8;
   constexpr uint32_t global_to_shared_copy_lines_per_warp_QK = (QK_SMEM_STRIDE == 32) ? 16 : (QK_SMEM_STRIDE == 64) ? 8 : 4;
   //                                                         for fp16: 32
@@ -197,6 +321,16 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
   constexpr uint32_t global_to_shared_line_lanes_O = (O_SMEM_STRIDE == 32) ? 4 : 8;
   constexpr uint32_t global_to_shared_copy_lines_per_warp_O = (O_SMEM_STRIDE == 32) ? 8 : 4;
 
+  // 计算加载Q、K、V、O到共享内存时，行和列各需要几次迭代：
+  // QK_smem_iters_row：Q和K每行迭代次数 = 步幅 ÷ (线程数 × 打包大小)。
+  
+  // Q_smem_iters_col：Q的列迭代次数 = Q总行数 ÷ (线程束数 × 每束行数)。
+  
+  // K_smem_iters_col：K的列迭代次数 = K总行数 ÷ (线程束数 × 每束行数)。
+  
+  // V_smem_iters_row和V_smem_iters_col：类似，基于V的步幅和head_dim。
+  
+  // O_smem_iters_row和O_smem_iters_col：基于O的步幅和CTA_Q。
   constexpr uint32_t QK_smem_iters_row = QK_SMEM_STRIDE / (global_to_shared_line_lanes_QK * PACK_SIZE_QK);
   constexpr uint32_t Q_smem_iters_col = CTA_Q / (num_warps * global_to_shared_copy_lines_per_warp_QK);
   constexpr uint32_t K_smem_iters_col = CTA_K / (num_warps * global_to_shared_copy_lines_per_warp_QK);
@@ -210,10 +344,11 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
   int8_t *K_lane_base_ptr = K + batch_id * stride_bz_k + (head_id / num_kv_groups) * stride_h_k + (CTA_K / num_warps * warp_id + lane_id / global_to_shared_line_lanes_QK) * stride_seq_k + (lane_id % global_to_shared_line_lanes_QK) * PACK_SIZE_QK;
   //                                                                for fp16: CTA_K / num_warps * warp_id * stride_seq_v + lane_id / global_to_shared_line_lanes_V * stride_seq_v
   int8_t *V_lane_base_ptr = V + batch_id * stride_bz_v + (head_id / num_kv_groups) * stride_h_v + head_dim / num_warps * warp_id * stride_d_v + lane_id / global_to_shared_line_lanes_V * stride_d_v + (lane_id % global_to_shared_line_lanes_V) * PACK_SIZE_V;
+  // 告诉搬运工把货放共享内存的哪个位置，位置是“打乱”过的（Swizzle），避免挤一块
   uint32_t Q_smem_offset_load = smem_Q.get_permuted_offset(warp_id * global_to_shared_copy_lines_per_warp_QK * Q_smem_iters_col + lane_id / global_to_shared_line_lanes_QK, lane_id % global_to_shared_line_lanes_QK);
   uint32_t K_smem_offset_load = smem_K.get_permuted_offset(warp_id * global_to_shared_copy_lines_per_warp_QK * K_smem_iters_col + lane_id / global_to_shared_line_lanes_QK, lane_id % global_to_shared_line_lanes_QK);
   uint32_t V_smem_offset_load = smem_V.get_permuted_offset(warp_id * global_to_shared_copy_lines_per_warp_V * V_smem_iters_col + lane_id / global_to_shared_line_lanes_V, lane_id % global_to_shared_line_lanes_V);
-
+// 计算Q、K、V在共享内存中给矩阵乘法（MMA，Tensor Core用）的偏移，基于线程束和线程编号。
   uint32_t Q_smem_offset_mma = smem_Q.get_permuted_offset(get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id % 16, lane_id / 16);
   uint32_t K_smem_offset_mma = smem_K.get_permuted_offset(get_warp_idx_k<num_warps_q, num_warps_k>() * WARP_K + lane_id % 8 + (lane_id / 16) * 8, (lane_id / 8) % 2);
   // for fp 16:
@@ -221,14 +356,33 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
   uint32_t V_smem_offset_mma = smem_V.get_permuted_offset(lane_id % 8 + (lane_id / 16) * 8, get_warp_idx_k<num_warps_q, num_warps_k>() * WARP_K / PACK_SIZE_V + (lane_id / 8) % 2);
 
   // for causal masking
+  // 记录Q和K的“门牌号”，方便后面判断哪些不能算（因果掩码），以及从哪开始搬数据。
+//   使用场景
+// 在因果模式（mask_mode == kCausal）下：
+// cpp
+
+// apply_causal_mask<num_tiles_q, num_tiles_k>(Q_idx_lane_base, K_idx_lane_base, RS_f32);
+
+// 如果 Q_idx_lane_base > K_idx_lane_base，说明关键在查询之前，保留分数；否则，设为负无穷（掩码掉）。
+
+
   uint32_t Q_idx_lane_base = bx * CTA_Q + get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / 4;
   uint32_t K_idx_lane_base = get_warp_idx_k<num_warps_q, num_warps_k>() * WARP_K + 2 * (lane_id % 4);
 
   // for loading
   uint32_t Q_load_idx_lane_base = bx * CTA_Q + CTA_Q / num_warps * warp_id + lane_id / global_to_shared_line_lanes_QK;
   uint32_t K_load_idx_lane_base = CTA_K / num_warps * warp_id + lane_id / global_to_shared_line_lanes_QK;
- 
+
   // read from Valid_Block_Num to get how much iterations we need to do
+//   计算当前线程块需要迭代多少次来处理稀疏的关键块。
+// Valid_Block_Num 是一个数组，记录每个查询块的有效关键块数量（稀疏注意力只处理部分 K）
+// num_iterations：从Valid_Block_Num取当前块需要迭代几次（稀疏性控制）。
+
+// 如果迭代次数是0，直接退出。
+
+// Lut（查找表）调整到当前批次、头和块的起始位置。
+
+// 直白说：查表看这块要干几次活，没活就下班；调整“导航图”（LUT）到当前任务的位置。
   const uint32_t num_block_q = gridDim.x;
   const uint32_t num_iterations = Valid_Block_Num[batch_id * num_qo_heads * num_block_q + head_id * num_block_q + bx];
 
@@ -251,6 +405,7 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
   uint32_t KV_block_increm = 0;
 
   // load K with predicate
+  // 查导航图找到第一个K的位置
   KV_block_increm = Lut[0];
   K_lane_base_ptr += KV_block_increm * CTA_K * stride_seq_k;
   K_load_idx_lane_base += KV_block_increm * CTA_K;
@@ -275,7 +430,10 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
   load_fp8_V_global_to_share<global_to_shared_line_lanes_V, global_to_shared_copy_lines_per_warp_V, V_smem_iters_row, V_smem_iters_col, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, CTA_K>(
     V_lane_base_ptr, V_smem_offset_load, stride_d_v, smem_V);
   cp_async::commit_group();
-
+  // 为什么从1开始，到倒数第二结束？：
+  // 前一次迭代（iter=0）已经在循环外加载并处理了（之前的代码）。
+  
+  // 最后一次迭代（iter=num_iterations-1）可能有特殊处理（比如写回结果），所以留到循环外
 #pragma unroll
   for (uint32_t iter = 1; iter < num_iterations - 1; iter++)
   {
@@ -288,6 +446,8 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
     
     float RS_f32[num_tiles_q][num_tiles_k][8];
 
+    // RS是量化后的整数，Softmax需要浮点数。
+    // dequant_scale（Q和K的缩放因子乘积）把量化值还原成真实分数
 #pragma unroll
     for (uint32_t fq = 0; fq < num_tiles_q; fq++)
     {
@@ -417,6 +577,7 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
       K_lane_base_ptr += KV_block_increm * CTA_K * stride_seq_k;
       K_load_idx_lane_base += KV_block_increm * CTA_K;
       K_idx_lane_base += KV_block_increm * CTA_K;
+      // 做double buffer，提前加载下一轮的K
       load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
         K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K);
       cp_async::commit_group();
