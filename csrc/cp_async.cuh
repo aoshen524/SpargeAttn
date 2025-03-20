@@ -95,6 +95,8 @@ __device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr) {
  * \param predicate Predicate value
  * \note fill zero is slower than not fill zero
  */
+// prefetch_mode == kPrefetch：多抓 128 字节到 L2 缓存。
+// 不预取：只管搬 16 字节。
 template <PrefetchMode prefetch_mode, SharedMemFillMode fill_mode, typename T>
 __device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr, bool predicate) {
 #ifdef CP_ASYNC_ENABLED

@@ -244,6 +244,16 @@ __device__ __forceinline__ void compute_half_qk(const smem_t<swizzle_mode, strid
   offset_K -= (2 * num_tiles_qk_inner);
 }
 
+// int32_t RS[][num_tiles_k][8], 在C++中，当你声明多维数组作为函数参数时，第一个维度可以省略，因为编译器不需要知道这个维度来确定内存位置。
+// 这并不是代表它真的“不确定”，而是意味着这个维度的大小由调用者（函数的使用者）来决定
+// 在函数内部，只要知道后两个维度（3和8），就能确定位置：
+
+// RS[i][j][k] 在内存中的位置是：
+
+// Copy
+// Edit
+// 位置 = i × (3 × 8) + j × 8 + k
+// 因此，第一个维度在函数中无需固定，而后面的维度必须指定。
 template <uint32_t num_warps_q, uint32_t num_warps_k, 
           uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_qk_inner, 
           SwizzleMode swizzle_mode, uint32_t stride, DataType DTypeQK>
@@ -390,6 +400,7 @@ __device__ __forceinline__ void apply_out_of_bound_mask(const uint32_t &K_idx_la
   }
 }
 
+// exp_offset: 一个布尔值，表示是否加入额外的常数偏移值（一般用于减少低精度运算（fp8）时的量化误差）。
 template <uint32_t num_tiles_q, uint32_t num_tiles_k, bool exp_offset>
 __device__ __forceinline__ void exponentiate_r(float RS[][num_tiles_k][8], float m[][2], const float &sm_scale)
 {
@@ -407,6 +418,8 @@ __device__ __forceinline__ void exponentiate_r(float RS[][num_tiles_k][8], float
 #pragma unroll
       for (uint32_t fk = 0; fk < num_tiles_k; fk++)
       {
+        // 对RS的特定元素（k*2+0, k*2+1, k*2+4, k*2+5）做缩放和指数运算：
+        
         RS[fq][fk][k * 2 + 0] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 0], sm_scale, negative_m));
         RS[fq][fk][k * 2 + 1] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 1], sm_scale, negative_m));
         RS[fq][fk][k * 2 + 4] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 4], sm_scale, negative_m));
@@ -429,30 +442,47 @@ __device__ __forceinline__ float update_mo(float RS[][num_tiles_k][8], DTypeSVAc
     for (uint32_t k = 0; k < 2; k++)
     {
       // assign the smallest value possible
+      // 从 m[fq][k] 中取出当前子分组（由 k 决定）的最大值，保存下来供后续比较
       float m_prev = m[fq][k];
+      
       float m_temp = -5000000.0f;
+      // 用嵌套的 max 函数两两比较，得出这 4 个数的最大值
+      // 一次获得当前tile q和多个tile k的最大值
 #pragma unroll
       for (uint32_t fk = 0; fk < num_tiles_k; fk++)
       {
         float m_local = max(max(RS[fq][fk][k * 2 + 0], RS[fq][fk][k * 2 + 1]),
                                 max(RS[fq][fk][k * 2 + 4], RS[fq][fk][k * 2 + 5]));
+                                
         m_temp = max(m_temp, m_local);
       }
       // exchange element with the 4 threads in the row
+      // 把 m_temp 乘以一个缩放因子 sm_scale（softmax 的 scale），调整数值范围，防止溢出。
       m_temp *= sm_scale;
+      // 这是一个CUDA指令，在warp（32个线程）内交换数据并比较。
 
+      // 0x1：线程0和1比较，2和3比较，等等。
+      
+      // 0x2：线程0和2比较，1和3比较。
+      
+      // 每次比较后取最大值，最终m_temp是这组线程里的最大值。
       m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x1)); // 0 exchange with 1, 2 exchange with 3
       m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x2)); // 0 exchange with 2, 1 exchange with 3
       
+      // 你看看新纪录比老纪录高了多少，记下这个差距，如果比之前记的还大，就更新一下
       local_max_diff = max(local_max_diff, m_temp - m_prev);
 
       m[fq][k] = max(m_prev, m_temp);
+      // 相当于乘以了m_prev又除以新的最大值的exp
+      /// TODO: 要是最大值没变其实不用更新和计算，或者最后再scale也行啊，这个是flash attention2？
       float o_scale = math::ptx_exp2(m_prev - m[fq][k]);
 
       // update denominator
+      // 相当于乘以了m_prev又除以新的最大值的exp
       d[fq][k] *= o_scale;
 
       // update RO
+      // k = 0负责0，1，4，5；k = 1负责2，3，6，7
 #pragma unroll
       for (uint32_t fv = 0; fv < num_tiles_v; fv++)
       {

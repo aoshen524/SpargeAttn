@@ -55,7 +55,7 @@
 // fuse_v_scale: 是否将V的缩放操作融合到计算中，以减少访存
 template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint32_t head_dim, DataType DTypeQK, QuantGranularity Q_GRAN, QuantGranularity K_GRAN,
         typename DTypeSVAccum = float, bool use_inst_buffer = false, PVThresholdMode pv_threashold_mode, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool fuse_v_scale=false, bool return_pv_count = false>
-__global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V, DTypeOut *__restrict__ O, int32_t *__restrict__ PV_Count, int32_t *__restrict__ Lut, int32_t *__restrict__ Valid_Block_Num, float *__restrict__ PV_Threshold,
+__global__ void qk_int_sv_f8_block_sparse_attn_kernel_k_drop_test(int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V, DTypeOut *__restrict__ O, int32_t *__restrict__ PV_Count, int32_t *__restrict__ Lut, int32_t *__restrict__ Sparse_Lut, int32_t *__restrict__ Valid_Block_Num, float *__restrict__ PV_Threshold, float sparse_threshold,
                       // Q、K、V的量化缩放因子，用于将int8/fp8转换回浮点数。
                       float *__restrict__ Q_scale, float *__restrict__ K_scale, float *__restrict__ V_scale,
                       const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
@@ -78,7 +78,7 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
   static_assert(CTA_K % 64 == 0);
 //   第一步：CTA_Q 和 CTA_K 是什么？
 // 在 CUDA 中，"CTA" 表示协作线程数组（Cooperative Thread Array），也就是一个线程块。这里：
-// CTA_Q：线程块处理的查询（Query，简称 Q）元素数量。
+// CTA_Q：线程块处理的查询（Query，简称 Q）元素数量。一个元素是1*d（head_dim）的向量。
 
 // CTA_K：线程块处理的关键（Key，简称 K）元素数量
 // 注意力计算
@@ -152,15 +152,15 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
 
 // 因果掩码开销：小的比例减少了被掩码掉的无效计算，因为关键块与查询的因果需求紧密匹配。
   static_assert(CTA_Q / CTA_K <= 2); // for efficient causal implementation
-// WARP_Q 是每个线程束处理的查询元素数
+// WARP_Q 是每个线程束处理的查询元素数，每个warp就负责读取WARP_Q个查询元素，然后计算Q·K^T的分数。
 /// TODO: 这里是在做warp specialization吗？不是的，只是说一个warp要完成多少的Q的任务，多少的K的任务，然后排列组合一下，得到总的warp数量
   constexpr uint32_t num_warps_q = CTA_Q / WARP_Q;
   constexpr uint32_t num_warps_k = CTA_K / WARP_K;
   constexpr uint32_t num_warps = num_warps_q * num_warps_k;
-// 每个线程束要处理的小矩阵乘法，再分成小块（tile），交给Tensor Core算矩阵乘法，看看要多少次tensor core的使用
-  constexpr uint32_t num_tiles_q = WARP_Q / MMA_QK_M;
+// 每个线程束要处理的小矩阵乘法，再分成小块（tile），交给Tensor Core算矩阵乘法，看看要有多少种不同的tensor core中的Q的内容，K的内容，V的内容，这样排列组合出多少种tensorcore的计算次数，因为每次计算的Q或者K之类的都不一样
+  constexpr uint32_t num_tiles_q = WARP_Q / MMA_QK_M; // 32 / 16 = 2
   constexpr uint32_t num_tiles_k = WARP_K / MMA_QK_N;
-  // 如果是int4：瓦片数 = head_dim ÷ 2 ÷ 32（因为int4比int8数据量少一半），目前理解是tensorcore有块存储，int4更小，所以存的更多，需要更少的瓦片数
+  // 内积归约遍历次数。如果是int4：瓦片数 = head_dim ÷ 2 ÷ 32（因为int4比int8数据量少一半），目前理解是tensorcore有块存储，int4更小，所以存的更多，需要更少的瓦片数
   constexpr uint32_t num_tiles_qk_inner = (DTypeQK == DataType::kInt8) ? (head_dim / MMA_QK_K) : (head_dim / 2 / MMA_QK_K);
   constexpr uint32_t num_tiles_v = head_dim / MMA_SV_N;
 // 直白说：这些是内存布局的“跨度”，告诉GPU怎么读写共享内存
@@ -200,6 +200,9 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
   int32_t RS[num_tiles_q][num_tiles_k][8];
   // 存输出O的中间结果（S·V的片段），维度是[Q瓦片数][V瓦片数][8]，类型是DTypeSVAccum（默认float）
   DTypeSVAccum RO[num_tiles_q][num_tiles_v][8];
+  // 分母和最大值的形状，不过不应该是q_tile_size * 1吗
+  // 在你的代码中，静态断言 static_assert(CTA_Q / CTA_K <= 2) 表明查询块（CTA_Q）和键块（CTA_K）的比例被限制为小于等于 2。这种设计是为了确保因果掩码的高效应用：
+  // d 的第二个维度是 [2]，表示每个查询瓦片有两个分母值, 分别对于和两个不同的K瓦片的结果的m和d，不过一个瓦片就是一行K吗，如果不是的话，那应该不止
   float m[num_tiles_q][2]; // max
   float d[num_tiles_q][2]; // denominator
 
@@ -282,6 +285,7 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
       d[fq][k] = 1.0f;
     }
   }
+  // 一，
   // 共享内存是一个线程块内共用的“工作台”，Q、K、V的数据要分开放。
 
   // Q从头开始（偏移0），K紧跟在Q后面，V再跟在K后面，靠偏移量分开。
@@ -290,7 +294,8 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
   constexpr uint32_t K_smem_idx_offset = CTA_Q;
   constexpr uint32_t V_smem_idx_offset = CTA_Q + CTA_K;
 
-  //  通过打乱数据存放顺序（比如按32字节、64字节、128字节为单位重新排列），减少线程间的“银行冲突”（bank conflict）
+  // 二，
+  //  1. q和k数据的粒度按照head dim * type size来算。2. 确定粒度，启动swizzle。3. 初始化smem。
   constexpr SwizzleMode swizzle_mode_QK = (QK_SMEM_STRIDE == 32) ? SwizzleMode::k32B : (QK_SMEM_STRIDE == 64) ? SwizzleMode::k64B : SwizzleMode::k128B;
   smem_t<swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK> smem_Q(smem);
   smem_t<swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK> smem_K(smem + K_smem_idx_offset * QK_SMEM_STRIDE);
@@ -302,6 +307,8 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
   constexpr SwizzleMode swizzle_mode_O = (O_SMEM_STRIDE == 32) ? SwizzleMode::k64B : SwizzleMode::k128B;
   smem_t<swizzle_mode_O, O_SMEM_STRIDE / PACK_SIZE_O> smem_O(smem);
 
+
+  // 三，
   // global_to_shared_line_lanes_*：每行数据分给几个线程（lane）去加载。
 
   // global_to_shared_copy_lines_per_warp_*：每个线程束（warp）负责加载几行。
@@ -385,7 +392,7 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
 // 直白说：查表看这块要干几次活，没活就下班；调整“导航图”（LUT）到当前任务的位置。
   const uint32_t num_block_q = gridDim.x;
   const uint32_t num_iterations = Valid_Block_Num[batch_id * num_qo_heads * num_block_q + head_id * num_block_q + bx];
-
+  // 连QK也不会算，直接跑了
   if (num_iterations == 0)
   {
     return;
@@ -457,6 +464,7 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
 #pragma unroll
         for (uint32_t k = 0; k < 8; k++)
         {
+          // 把整数转成浮点数。rz的意思是“round to zero”（向零舍入），一种快速转换方式
           RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
         }
       }
@@ -475,9 +483,13 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
         K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K);
       cp_async::commit_group();
   
+      // 调用 update_mo，传入具体的分块数和参数，计算初始的 local_max_diff。
       float local_max_diff = update_mo<num_tiles_q, num_tiles_k, num_tiles_v, false, false, false>(RS_f32, RO, m, d, sm_scale);
 
       // reduce max diff in a warp
+      
+
+      // 然后用三次 __shfl_xor_sync 在更大范围内（线程 0 和 4，0 和 8，0 和 16）比较，得到整个 warp 的最大差值。
       local_max_diff = max(local_max_diff, __shfl_xor_sync(0xffffffff, local_max_diff, 0x4));
       local_max_diff = max(local_max_diff, __shfl_xor_sync(0xffffffff, local_max_diff, 0x8));
       local_max_diff = max(local_max_diff, __shfl_xor_sync(0xffffffff, local_max_diff, 0x10));
@@ -517,11 +529,12 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, in
       {
         if constexpr (return_pv_count)
         {
+          // 记录计算了几个pv block
           pv_count++;
         }
 
         exponentiate_r<num_tiles_q, num_tiles_k, true>(RS_f32, m, sm_scale);
-        
+        // 累加Softmax的分母
         if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
         {
           accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kCudaCore>(RS_f32, d);
