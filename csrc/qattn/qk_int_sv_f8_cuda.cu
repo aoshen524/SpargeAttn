@@ -55,7 +55,7 @@
 // fuse_v_scale: 是否将V的缩放操作融合到计算中，以减少访存
 template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint32_t head_dim, DataType DTypeQK, QuantGranularity Q_GRAN, QuantGranularity K_GRAN,
         typename DTypeSVAccum = float, bool use_inst_buffer = false, PVThresholdMode pv_threashold_mode, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool fuse_v_scale=false, bool return_pv_count = false>
-__global__ void qk_int_sv_f8_block_sparse_attn_kernel_k_drop_test(int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V, DTypeOut *__restrict__ O, int32_t *__restrict__ PV_Count, int32_t *__restrict__ Lut, int32_t *__restrict__ Sparse_Lut, int32_t *__restrict__ Valid_Block_Num, float *__restrict__ PV_Threshold, float sparse_threshold,
+__global__ void qk_int_sv_f8_block_sparse_attn_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V, DTypeOut *__restrict__ O, int32_t *__restrict__ PV_Count, int32_t *__restrict__ Lut, int32_t *__restrict__ Valid_Block_Num, float *__restrict__ PV_Threshold,
                       // Q、K、V的量化缩放因子，用于将int8/fp8转换回浮点数。
                       float *__restrict__ Q_scale, float *__restrict__ K_scale, float *__restrict__ V_scale,
                       const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
@@ -355,7 +355,8 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel_k_drop_test(int8_t *__rest
   uint32_t Q_smem_offset_load = smem_Q.get_permuted_offset(warp_id * global_to_shared_copy_lines_per_warp_QK * Q_smem_iters_col + lane_id / global_to_shared_line_lanes_QK, lane_id % global_to_shared_line_lanes_QK);
   uint32_t K_smem_offset_load = smem_K.get_permuted_offset(warp_id * global_to_shared_copy_lines_per_warp_QK * K_smem_iters_col + lane_id / global_to_shared_line_lanes_QK, lane_id % global_to_shared_line_lanes_QK);
   uint32_t V_smem_offset_load = smem_V.get_permuted_offset(warp_id * global_to_shared_copy_lines_per_warp_V * V_smem_iters_col + lane_id / global_to_shared_line_lanes_V, lane_id % global_to_shared_line_lanes_V);
-// 计算Q、K、V在共享内存中给矩阵乘法（MMA，Tensor Core用）的偏移，基于线程束和线程编号。
+
+  // 计算Q、K、V在共享内存中给矩阵乘法（MMA，Tensor Core用）的偏移，基于线程束和线程编号。
   uint32_t Q_smem_offset_mma = smem_Q.get_permuted_offset(get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id % 16, lane_id / 16);
   uint32_t K_smem_offset_mma = smem_K.get_permuted_offset(get_warp_idx_k<num_warps_q, num_warps_k>() * WARP_K + lane_id % 8 + (lane_id / 16) * 8, (lane_id / 8) % 2);
   // for fp 16:
@@ -379,7 +380,7 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel_k_drop_test(int8_t *__rest
   // for loading
   uint32_t Q_load_idx_lane_base = bx * CTA_Q + CTA_Q / num_warps * warp_id + lane_id / global_to_shared_line_lanes_QK;
   uint32_t K_load_idx_lane_base = CTA_K / num_warps * warp_id + lane_id / global_to_shared_line_lanes_QK;
-
+ 
   // read from Valid_Block_Num to get how much iterations we need to do
 //   计算当前线程块需要迭代多少次来处理稀疏的关键块。
 // Valid_Block_Num 是一个数组，记录每个查询块的有效关键块数量（稀疏注意力只处理部分 K）
@@ -392,6 +393,7 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel_k_drop_test(int8_t *__rest
 // 直白说：查表看这块要干几次活，没活就下班；调整“导航图”（LUT）到当前任务的位置。
   const uint32_t num_block_q = gridDim.x;
   const uint32_t num_iterations = Valid_Block_Num[batch_id * num_qo_heads * num_block_q + head_id * num_block_q + bx];
+
   // 连QK也不会算，直接跑了
   if (num_iterations == 0)
   {
@@ -437,6 +439,7 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel_k_drop_test(int8_t *__rest
   load_fp8_V_global_to_share<global_to_shared_line_lanes_V, global_to_shared_copy_lines_per_warp_V, V_smem_iters_row, V_smem_iters_col, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, CTA_K>(
     V_lane_base_ptr, V_smem_offset_load, stride_d_v, smem_V);
   cp_async::commit_group();
+
   // 为什么从1开始，到倒数第二结束？：
   // 前一次迭代（iter=0）已经在循环外加载并处理了（之前的代码）。
   
@@ -534,6 +537,7 @@ __global__ void qk_int_sv_f8_block_sparse_attn_kernel_k_drop_test(int8_t *__rest
         }
 
         exponentiate_r<num_tiles_q, num_tiles_k, true>(RS_f32, m, sm_scale);
+        
         // 累加Softmax的分母
         if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
         {
