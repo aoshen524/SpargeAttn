@@ -46,7 +46,7 @@ template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint3
         bool use_inst_buffer = false, PVThresholdMode pv_threashold_mode, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool return_pv_count = false>
 __global__ void qk_int_sv_f16_block_sparse_attn_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K, half *__restrict__ V, DTypeOut *__restrict__ O, int32_t *__restrict__ PV_Count, int32_t *__restrict__ Lut, int32_t *__restrict__ Valid_Block_Num, float *__restrict__ PV_Threshold,
                       float *__restrict__ Q_scale, float *__restrict__ K_scale,
-                      const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
+                      const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups, // 1
                       const uint32_t stride_bz_q, const uint32_t stride_seq_q, const uint32_t stride_h_q,
                       const uint32_t stride_bz_k, const uint32_t stride_seq_k, const uint32_t stride_h_k,
                       const uint32_t stride_bz_v, const uint32_t stride_seq_v, const uint32_t stride_h_v,
@@ -58,7 +58,7 @@ __global__ void qk_int_sv_f16_block_sparse_attn_kernel(int8_t *__restrict__ Q, i
   static_assert(Q_GRAN == QuantGranularity::kPerBlock || Q_GRAN == QuantGranularity::kPerWarp || Q_GRAN == QuantGranularity::kPerThread, "Q_GRAN must be kPerBlock, kPerWarp or kPerThread");
   static_assert(K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp || K_GRAN == QuantGranularity::kPerThread, "K_GRAN must be kPerBlock, kPerWarp or kPerThread");
   static_assert(std::is_same<DTypeOut, half>::value || std::is_same<DTypeOut, nv_bfloat16>::value, "DTypeOut must be half or nv_bfloat16");
-  static_assert(head_dim % 64 == 0, "head_dim must be a multiple of 64");
+  static_assert(head_dim % 64 == 0, "head_dim must be a multiple of 64"); // 64
   static_assert(CTA_Q / CTA_K <= 2); // for efficient causal implementation
 
   using DTypeOut2 = typename std::conditional<std::is_same<DTypeOut, half>::value, half2, nv_bfloat162>::type;
@@ -164,8 +164,8 @@ __global__ void qk_int_sv_f16_block_sparse_attn_kernel(int8_t *__restrict__ Q, i
     }
   }
 
-  constexpr uint32_t K_smem_idx_offset = CTA_Q;
-  constexpr uint32_t V_smem_idx_offset = CTA_Q + CTA_K;
+  constexpr uint32_t K_smem_idx_offset = CTA_Q; // 128
+  constexpr uint32_t V_smem_idx_offset = CTA_Q + CTA_K; // 128 + 64 = 192
 
   constexpr SwizzleMode swizzle_mode_QK = (QK_SMEM_STRIDE == 32) ? SwizzleMode::k32B : (QK_SMEM_STRIDE == 64) ? SwizzleMode::k64B : SwizzleMode::k128B;
   smem_t<swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK> smem_Q(smem);
@@ -267,6 +267,7 @@ __global__ void qk_int_sv_f16_block_sparse_attn_kernel(int8_t *__restrict__ Q, i
     compute_int_qk<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_qk_inner, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, DTypeQK>(
       smem_Q, smem_K, RS, Q_smem_offset_mma, K_smem_offset_mma);
 
+    /// TODO: 这个得提出去循环
     float RS_f32[num_tiles_q][num_tiles_k][8];
 
 #pragma unroll
@@ -910,55 +911,61 @@ torch::Tensor qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_thresh
   CHECK_DIMS(pv_threshold, 1);
   CHECK_DIMS(query_scale, 3);
   CHECK_DIMS(key_scale, 3);
-
-  const int head_dim = query.size(3);
-  const int batch_size = query.size(0);
-
-  int stride_bz_q = query.stride(0);
-  int stride_bz_k = key.stride(0);
-  int stride_bz_v = value.stride(0);
-  int stride_bz_o = output.stride(0);
+// query 的最后一个维度（D）
+  const int head_dim = query.size(3); // 64
+  const int batch_size = query.size(0); // 2
+  // 如果张量是连续的（contiguous），stride_bz_q = H * N * D。
+  // 例如，B=2, H=30, N=18002, D=64：
+  
+  // stride_bz_q = 30 * 18002 * 64 = 34,537,280。
+  
+  // 意思是：从 query[0, 0, 0, 0] 到 query[1, 0, 0, 0] 需要跳过 34,537,280 个元素。
+  int stride_bz_q = query.stride(0); // 2 * 17776 * 64 = 34,537,280
+  int stride_bz_k = key.stride(0); // 2 * 17776 * 64 = 34,537,280
+  int stride_bz_v = value.stride(0); // 2 * 17776 * 64 = 34,537,280
+  int stride_bz_o = output.stride(0); // 2 * 17776 * 64 = 34,537,280
 
   int qo_len, kv_len, num_qo_heads, num_kv_heads;
   int stride_seq_q, stride_seq_k, stride_seq_v, stride_seq_o;
   int stride_h_q, stride_h_k, stride_h_v, stride_h_o;
-
+  // tensor_layout = 0: [B, N, H, D]，N = seq_len = 17776，正常的布局
   if (tensor_layout == 0)
   {
     qo_len = query.size(1);
     kv_len = key.size(1);
-    num_qo_heads = query.size(2);
-    num_kv_heads = key.size(2);
+    num_qo_heads = query.size(2); // 30
+    num_kv_heads = key.size(2); // 30
     CHECK_SHAPE(key, batch_size, kv_len, num_kv_heads, head_dim);
     CHECK_SHAPE(value, batch_size, kv_len, num_kv_heads, head_dim);
     CHECK_SHAPE(output, batch_size, qo_len, num_qo_heads, head_dim);
 
-    stride_seq_q = query.stride(1);
+    stride_seq_q = query.stride(1); // 30 * 64 = 1920
     stride_seq_k = key.stride(1);
     stride_seq_v = value.stride(1);
     stride_seq_o = output.stride(1);
 
-    stride_h_q = query.stride(2);
+    stride_h_q = query.stride(2); // 64
     stride_h_k = key.stride(2);
     stride_h_v = value.stride(2);
     stride_h_o = output.stride(2);
   }
+  // [B, H, N, D]
   else if (tensor_layout == 1)
   {
-    qo_len = query.size(2);
+    qo_len = query.size(2); // 17776
     kv_len = key.size(2);
-    num_qo_heads = query.size(1);
+    num_qo_heads = query.size(1); // 30
     num_kv_heads = key.size(1);
     CHECK_SHAPE(key, batch_size, num_kv_heads, kv_len, head_dim);
     CHECK_SHAPE(value, batch_size, num_kv_heads, kv_len, head_dim);
     CHECK_SHAPE(output, batch_size, num_qo_heads, qo_len, head_dim);
 
-    stride_seq_q = query.stride(2);
+    stride_seq_q = query.stride(2); // 64
     stride_seq_k = key.stride(2);
     stride_seq_v = value.stride(2);
     stride_seq_o = output.stride(2);
 
-    stride_h_q = query.stride(1);
+    stride_h_q = query.stride(1); // 17776 * 64 = 1,135,360
     stride_h_k = key.stride(1);
     stride_h_v = value.stride(1);
     stride_h_o = output.stride(1);
@@ -974,9 +981,9 @@ torch::Tensor qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_thresh
     throw std::invalid_argument(err_msg.str());  
   }
 
-  const int num_kv_groups = num_qo_heads / num_kv_heads;
+  const int num_kv_groups = num_qo_heads / num_kv_heads; // 1
   
-  torch::Tensor pv_count = torch::empty({0});
+  torch::Tensor pv_count = torch::empty({0}); // 最好不要在c++开辟显存？用库了可以吗
 
   auto output_dtype = output.scalar_type();
 
@@ -986,8 +993,8 @@ torch::Tensor qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_thresh
         DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
           DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
             constexpr int CTA_Q = 128;
-            constexpr int CTA_K = 64;
-            constexpr int WARP_Q = (HEAD_DIM == 64) ? 32 : 16;
+            constexpr int CTA_K = 64; // Q和K在flash attention里面为了计算效率，分块大小是不一样的，这个不一样延续到了之前的pooling的时候的分块，保持了一致性。
+            constexpr int WARP_Q = (HEAD_DIM == 64) ? 32 : 16; // 是32
             constexpr int WARP_K = 64;
             
             if constexpr (RETURN_PV_COUNT)
@@ -999,16 +1006,19 @@ torch::Tensor qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_thresh
 
             if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerBlock))
             {
+              // query_scale [2, 30, 138]
               CHECK_SHAPE(query_scale, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q));
               CHECK_SHAPE(key_scale, batch_size, num_kv_heads, div_ceil(kv_len, CTA_K));
             }
             else if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp))
             {
+              // query_scale [2, 30, 138 * (128 / 32)]
               CHECK_SHAPE(query_scale, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q) * (CTA_Q / WARP_Q));
               CHECK_SHAPE(key_scale, batch_size, num_kv_heads, div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K));
             }
             else if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread))
             {
+              // query_scale [2, 30, 138 * (128 / 32) * 8]
               CHECK_SHAPE(query_scale, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q) * (CTA_Q / WARP_Q) * 8);
               CHECK_SHAPE(key_scale, batch_size, num_kv_heads, div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K) * 4);
             }
@@ -1021,17 +1031,40 @@ torch::Tensor qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_thresh
             CHECK_SHAPE(valid_block_num, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q));
             CHECK_SHAPE(pv_threshold, num_qo_heads);
 
-            //                                     smem_Q                                     smem_K                            smem_V                     smem_O
+            //   128 * 64 * 1 byte                     smem_Q                64 * 64 * 1 byte                    smem_K          64 * 64 * 2 byte                 smem_V         128 * 64 * 1 byte           smem_O
             size_t smem_max = std::max(CTA_Q * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(int8_t) + CTA_K * HEAD_DIM * sizeof(half), CTA_Q * HEAD_DIM * sizeof(half));
             
             auto kernel_func = qk_int_sv_f16_block_sparse_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8, static_cast<QuantGranularity>(QK_QUANT_GRAN), static_cast<QuantGranularity>(QK_QUANT_GRAN), true, PVThresholdMode::kPerBlock, DTypeOut, ComputeUnit::kTensorCore, 
                                                           mask_mode, RETURN_PV_COUNT>;
 
             cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
-
+            // 17776 / 128, 64, 2
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
+            // 32, 4 * 1
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
+            // 每个 Block 处理的 Q 数据：
+            // 每个 block 负责一个 q 块（CTA_Q 个 query 元素）。
+            
+            // CTA_Q = 128，head_dim = 64。
+            
+            // 形状是 [CTA_Q, head_dim]，即 [128, 64]。
+            
+            // 直白解释：
+            // 每个 block 处理 128 个 query 向量，每个向量有 64 个维度。
+            
+            // 总共 128 * 64 = 8192 个元素（int8 格式）。
+            // 每个 Block 处理的 K 数据：
+            // 每个 block 负责一个 k 块（CTA_K 个 key 元素）。
 
+            // CTA_K = 64，head_dim = 64。
+
+            // 形状是 [CTA_K, head_dim]，即 [64, 64]。
+
+            // 直白解释：
+            // 每个 block 处理 64 个 key 向量，每个向量有 64 个维度。
+
+            // 总共 64 * 64 = 4096 个元素（int8 格式）。
+            
             kernel_func<<<grid, block, smem_max>>>(
               query.data_ptr<int8_t>(), 
               key.data_ptr<int8_t>(),

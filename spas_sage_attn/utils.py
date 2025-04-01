@@ -61,8 +61,10 @@ def block_map_lut_triton(block_map):
     assert block_map.dim() == 4
     assert block_map.is_contiguous()
 
+    # block_map 的形状是 [2, 30, 139, 278]
     B, H, Q, K = block_map.shape
     lut = torch.zeros((B, H, Q, K), dtype=torch.int32, device=block_map.device)
+    # 记录每个 q 块（[b, h, q]）有多少个 k 块需要计算
     valid_block_num = torch.zeros((B, H, Q), dtype=torch.int32, device=block_map.device)
 
     grid = (B, H, Q)
@@ -163,11 +165,13 @@ def get_pool_sim_triton_simmean(x, block_size, simthreshd1):
     triton_bmm_pool_sim_simmean[grid](x, pool, sim_blocks, simthreshd1, N=N, D=D, BS=block_size)
     return pool, sim_blocks
 
+# x_mean：x 的均值（可选），形状是 [B, H, 1, D]
 def get_pool_sim_triton_simmean_fuse_quant(x, x_mean, block_size, simthreshd1):
     x = x.contiguous()
     B, H, N, D = x.shape
     nblock = (N + block_size - 1) // block_size  # Number of blocks per feature map
     pool = torch.empty((B, H, nblock, D), device=x.device, dtype=x.dtype)
+    # 记录每个块是否“重要”（布尔值，True 表示重要）
     sim_blocks = torch.empty((B, H, nblock), device=x.device, dtype=torch.bool)
     x_quant = torch.empty(x.shape, device=x.device, dtype=torch.int8)
     x_scale = torch.empty((B, H, nblock), device=x.device, dtype=torch.float32)
@@ -258,13 +262,22 @@ def get_block_map_meansim_fuse_quant(q, k, km=None, is_causal=False, BLKQ=128, B
     Headnum = q.size(1)
     simthreshd1 = hyperparameter_check(simthreshd1, Headnum, q.device)
     cdfthreshd = hyperparameter_check(cdfthreshd, Headnum, q.device)
+    # Q和K的分块大小是不一样的，沿着长度进行分块
     nq = (q.shape[-2] + BLKQ - 1) // BLKQ
     nk = (k.shape[-2] + BLKK - 1) // BLKK
     pooled_qblocks, sim_qblocks, q_int8, q_scale = get_pool_sim_triton_simmean_fuse_quant(q, None, BLKQ, simthreshd1)
     pooled_kblocks, sim_kblocks, k_int8, k_scale = get_pool_sim_triton_simmean_fuse_quant(k, km, BLKK, simthreshd1)
 
+    # sim_kblocks：形状从 [B, H, nk] 扩展到 [B, H, nq, nk]，例如 [2, 30, 141, 282]。
+    # unsqueeze(-2)：在倒数第二个维度插入一个维度，变成 [B, H, 1, nk]。
+    # expand(-1, -1, nq, -1)：将第 2 个维度扩展到 nq
+
     sim_kblocks = sim_kblocks.unsqueeze(-2).expand(-1, -1, nq, -1)  # faster than repeat
+    #     sim_qblocks：形状从 [B, H, nq] 扩展到 [B, H, nq, nk]，例如 [2, 30, 141, 282]。
+    # unsqueeze(-1)：在最后一个维度插入一个维度，变成 [B, H, nq, 1]。
+    # expand(-1, -1, -1, nk)：将最后一个维度扩展到 nk。
     sim_qblocks = sim_qblocks.unsqueeze(-1).expand(-1, -1, -1, nk)
+    # 计算块级别的注意力分数
     pooled_score = pooled_qblocks @ pooled_kblocks.transpose(-1, -2) * q.shape[-1] ** -0.5
     pooled_score[~sim_kblocks] = -torch.inf
     if is_causal:
@@ -275,10 +288,14 @@ def get_block_map_meansim_fuse_quant(q, k, km=None, is_causal=False, BLKQ=128, B
         pooled_score = pooled_score.masked_fill(~causal_mask[None, None, ...], -torch.inf)
     pooled_score = pooled_score.softmax(-1)
     sorted_score = torch.sort(pooled_score, dim=-1, descending=True)
+    #  [B, H, nq, nk]
     cdf = torch.cumsum(sorted_score.values, dim=-1)
     B, H, Q, K = cdf.shape
     cdfthreshd_ts = cdfthreshd.view(1, H, 1, 1)
     cdfthreshd_ts = cdfthreshd_ts.expand(B, -1, Q, 1).contiguous()
+#     在 cdf 中查找 cdfthreshd_ts 的位置。
+# 例如，cdfthreshd = 0.9，表示选择累积和达到 90% 的块。
+# 返回的 num_to_select 形状是 [B, H, Q]，例如 [2, 30, 141]，表示每个 q 块需要保留的 k 块数量。
     num_to_select = torch.searchsorted(cdf, cdfthreshd_ts, right=True).squeeze(-1)
     final_map = torch.zeros_like(pooled_score, dtype=torch.bool)
     final_map[~sim_kblocks] = 1
@@ -288,6 +305,7 @@ def get_block_map_meansim_fuse_quant(q, k, km=None, is_causal=False, BLKQ=128, B
         final_map = final_map * causal_mask[None, None, ...]
 
     if attention_sink:
+        # 将 k 的第一个块设为 1（表示需要计算）
         final_map[:, :, :, 0] = 1
     
     if not return_lut:
