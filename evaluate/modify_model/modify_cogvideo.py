@@ -7,7 +7,6 @@ from diffusers.models.attention_processor import Attention
 from diffusers.models import CogVideoXTransformer3DModel
 from spas_sage_attn.autotune import SparseAttentionMeansim, extract_sparse_attention_state_dict, load_sparse_attention_state_dict
 
-
 class SageAttnCogVideoXAttnProcessor:
     r"""
     Processor for implementing scaled dot-product attention for the CogVideoX model. It applies a rotary embedding on
@@ -26,6 +25,7 @@ class SageAttnCogVideoXAttnProcessor:
         encoder_hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
+        sparse_table: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         assert attention_mask is None, "Attention mask is not supported"
@@ -49,37 +49,138 @@ class SageAttnCogVideoXAttnProcessor:
         inner_dim = key.shape[-1]
         head_dim = inner_dim // attn.heads
 
+        # 调整 query, key, value 的形状并转置
         query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
+        # 应用规范化（如果存在）
         if attn.norm_q is not None:
             query = attn.norm_q(query)
         if attn.norm_k is not None:
             key = attn.norm_k(key)
 
-        # Apply RoPE if needed
+        # 应用 RoPE（旋转位置编码）
         if image_rotary_emb is not None:
             from diffusers.models.embeddings import apply_rotary_emb
-
             query[:, :, text_seq_length:] = apply_rotary_emb(query[:, :, text_seq_length:], image_rotary_emb)
             if not attn.is_cross_attention:
                 key[:, :, text_seq_length:] = apply_rotary_emb(key[:, :, text_seq_length:], image_rotary_emb)
 
-        hidden_states = attn.inner_attention(query, key, value, is_causal=False)
+        if self.use_kv_sparse and not self.evaluate_mode:
+            # Pruning
+            key, value = self.mask_kv(key, value, sparse_table)
+        
+        # 执行注意力计算
+        outputs = attn.inner_attention(query, key, value, is_causal=False, return_sparse_table=self.evaluate_mode, kv_sparse_threshold=self.kv_sparse_threshold)
+        hidden_states = outputs["o"]
+        if self.use_kv_sparse and self.evaluate_mode:
+            sparse_table = outputs["sparse_table"]
 
+        # 调整形状
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
 
-        # linear proj
+        # 线性投影和 dropout
         hidden_states = attn.to_out[0](hidden_states)
-        # dropout
         hidden_states = attn.to_out[1](hidden_states)
 
+        # 分割 hidden_states 和 encoder_hidden_states
         encoder_hidden_states, hidden_states = hidden_states.split(
             [text_seq_length, hidden_states.size(1) - text_seq_length], dim=1
         )
-        return hidden_states, encoder_hidden_states
+
+        processor_outputs = {
+            "hidden_states": hidden_states,
+            "encoder_hidden_states": encoder_hidden_states,
+        }
+        if self.use_kv_sparse and self.evaluate_mode:
+            processor_outputs["sparse_table"] = sparse_table
+        return processor_outputs
     
+    def set_sparse_properties(
+        self,
+        use_kv_sparse: bool = False,
+        kv_sparse_threshold: float = 0.1,
+        evaluate_mode: bool = False,
+    ):
+        """
+        Set sparse properties for the attention processor.
+
+        Args:
+            use_kv_sparse (bool): Whether to use key-value sparsity.
+            kv_sparse_threshold (float): Threshold for key-value sparsity.
+            evaluate_mode (bool): Whether the model is in evaluation mode.
+        """
+        self.use_kv_sparse = use_kv_sparse
+        self.kv_sparse_threshold = kv_sparse_threshold
+        self.evaluate_mode = evaluate_mode
+
+    def mask_kv(self, key: torch.Tensor, value: torch.Tensor, sparse_table: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Mask the key and value tensors based on the sparse table.
+
+        Args:
+            key (torch.Tensor): Key tensor.
+            value (torch.Tensor): Value tensor.
+            sparse_table (torch.Tensor): Sparse table indicating which keys/values to keep.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Pruned key and value tensors.
+        """
+        # Prune key and value based on sparse_table
+        # Original behavior: set to 0 where sparse_table is 0
+        # Expand sparse_table to broadcast across heads and head_size dimensions
+        # sparse_table shape: [batch_size, seq_len]
+        # key/value shape: [batch_size, num_heads, seq_len, head_size]
+        batch_size, seq_len = sparse_table.shape
+        batch_size_k, num_heads, seq_len_k, head_size = key.shape
+        
+        # Verify compatible dimensions
+        assert batch_size == batch_size_k, "Batch sizes must match"
+        assert seq_len == seq_len_k, "Sequence lengths must match"
+        sparse_table_expanded = sparse_table.unsqueeze(1).unsqueeze(3)
+        
+        # Create mask: 1 where sparse_table is 1 (keep), 0 where sparse_table is 0 (prune)
+        mask = sparse_table_expanded.float()
+        
+        # Apply mask to key and value
+        key = key * mask
+        value = value * mask
+    
+        return key, value
+    
+    def prune_kv(self, key: torch.Tensor, value: torch.Tensor, sparse_table: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len = sparse_table.shape
+        batch_size_k, num_heads, seq_len_k, head_size = key.shape
+        
+        # Verify compatible dimensions
+        assert batch_size == batch_size_k, "Batch sizes must match"
+        assert seq_len == seq_len_k, "Sequence lengths must match"
+        
+        # Get indices where sparse_table is 1 (positions to keep)
+        keep_mask = sparse_table.bool()  # [batch_size, seq_len]
+        
+        # Reshape key and value for gathering
+        key_reshaped = key.reshape(batch_size, num_heads, seq_len, head_size)
+        value_reshaped = value.reshape(batch_size, num_heads, seq_len, head_size)
+        
+        # For each batch, gather the positions we want to keep
+        # We need to apply the mask separately for each batch
+        key_pruned = []
+        value_pruned = []
+        for b in range(batch_size):
+            batch_mask = keep_mask[b]  # [seq_len]
+            key_batch = key_reshaped[b, :, :, :][:, batch_mask, :]  # [num_heads, new_seq_len, head_size]
+            value_batch = value_reshaped[b, :, :, :][:, batch_mask, :]  # [num_heads, new_seq_len, head_size]
+            key_pruned.append(key_batch)
+            value_pruned.append(value_batch)
+        
+        # Stack the results back together
+        key = torch.stack(key_pruned)  # [batch_size, num_heads, new_seq_len, head_size]
+        value = torch.stack(value_pruned)  # [batch_size, num_heads, new_seq_len, head_size]
+
+        return key, value
+
 
 def set_spas_sage_attn_cogvideox(
     model: CogVideoXTransformer3DModel,
@@ -89,7 +190,7 @@ def set_spas_sage_attn_cogvideox(
 ):
     for idx, block in enumerate(model.transformer_blocks):
         block.attn1.verbose = verbose
-        block.attn1.inner_attention = SparseAttentionMeansim(l1=l1, pv_l1=pv_l1)  # SparseAttention() # only register to model could be saved by ckpt
+        block.attn1.inner_attention = SparseAttentionMeansim(l1=l1, pv_l1=pv_l1, layer_id=idx)
         origin_processor = block.attn1.get_processor()
         processor = SageAttnCogVideoXAttnProcessor(idx, )
         block.attn1.set_processor(processor)

@@ -339,3 +339,78 @@ def block_map_lut(block_map):
     lut[:, :, :, 1:] = lut[:, :, :, 1:] - lut[:, :, :, :-1]
 
     return lut.to(torch.int32), valid_entry_num.to(torch.int32)
+
+
+def get_attn_qk_sparse_table_int8(Q, K, scale, kv_sparse_threshold):
+    batchsize, num_heads, seq_length, head_size = Q.shape
+    device = Q.device
+    dtype = torch.float32
+
+    # Initialize sparse_table with float32 to store intermediate results
+    sparse_table = torch.zeros(batchsize, num_heads, seq_length, device=device, dtype=dtype)
+
+    grid = (batchsize, num_heads, seq_length)
+    BLOCK_SIZE_HEAD = triton.next_power_of_2(head_size)
+
+    attn_qk_int8_kernel[grid](
+        Q, K, sparse_table,
+        Q.stride(0), Q.stride(1), Q.stride(2),
+        K.stride(0), K.stride(1), K.stride(2),
+        sparse_table.stride(0), sparse_table.stride(1),
+        seq_length, head_size,
+        scale,
+        BLOCK_SIZE_HEAD=BLOCK_SIZE_HEAD
+    )
+    
+    # Take mean across heads
+    sparse_table = sparse_table.mean(dim=1)
+    
+    # Convert to binary table: 0 if value <= kv_sparse_threshold, 1 otherwise
+    sparse_binary_table = (sparse_table > kv_sparse_threshold).to(torch.int8)
+    
+    return sparse_binary_table
+
+
+@triton.jit
+def attn_qk_int8_kernel(
+    Q_ptr, K_ptr, sparse_table_ptr,
+    batch_stride_q, head_stride_q, seq_stride_q,
+    batch_stride_k, head_stride_k, seq_stride_k,
+    sparse_batch_stride, sparse_head_stride,
+    seq_length, head_size,
+    scale,
+    BLOCK_SIZE_HEAD: tl.constexpr,
+):
+    batch_id = tl.program_id(0)
+    head_id = tl.program_id(1)
+    seq_id = tl.program_id(2)
+
+    head_offsets = tl.arange(0, BLOCK_SIZE_HEAD)
+    q_offset = batch_id * batch_stride_q + head_id * head_stride_q + seq_id * seq_stride_q + head_offsets
+
+    q_int8 = tl.load(Q_ptr + q_offset, mask=head_offsets < head_size, other=0)
+    q = q_int8.to(tl.float32) * scale
+
+    attn_max = float('-inf')
+
+    for i in range(seq_length):
+        k_offset = batch_id * batch_stride_k + head_id * head_stride_k + i * seq_stride_k + head_offsets
+        k_int8 = tl.load(K_ptr + k_offset, mask=head_offsets < head_size, other=0)
+        k = k_int8.to(tl.float32) * scale
+
+        attn_score = tl.sum(q * k)
+        attn_max = tl.maximum(attn_max, attn_score)
+
+    # recompute for numerical stability softmax
+    exp_sum = 0.0
+    for i in range(seq_length):
+        k_offset = batch_id * batch_stride_k + head_id * head_stride_k + i * seq_stride_k + head_offsets
+        k_int8 = tl.load(K_ptr + k_offset, mask=head_offsets < head_size, other=0)
+        k = k_int8.to(tl.float32) * scale
+
+        attn_score = tl.sum(q * k)
+        exp_sum += tl.exp(attn_score - attn_max)
+
+    # Store the intermediate result
+    sparse_offset = batch_id * sparse_batch_stride + head_id * sparse_head_stride + seq_id
+    tl.store(sparse_table_ptr + sparse_offset, exp_sum)

@@ -22,6 +22,7 @@ def parse_args():
     parser.add_argument(
         "--use_spas_sage_attn", action="store_true", help="Use Sage Attention"
     )
+    # verbose 控制是否打印详细信息
     parser.add_argument("--verbose", action="store_true", help="Verbose")
     parser.add_argument(
         "--out_path",
@@ -34,6 +35,23 @@ def parse_args():
         type=str,
         default="evaluate/models_dict/CogVideoX-2b_0.05_0.06.pt",
         help="model_out_path",
+    )
+    parser.add_argument(
+        "--use_kv_sparse",
+        action="store_true",
+        help="Whether to use kv sparse attention",
+    )
+    parser.add_argument(
+        "--num_evaluate_layer",
+        type=int,
+        default=1,
+        help="Number of layers to evaluate",
+    )
+    parser.add_argument(
+        "--kv_sparse_threshold",
+        type=float,
+        default=1.01,
+        help="Threshold for kv sparse attention",
     )
     args = parser.parse_args()
     return args
@@ -56,7 +74,7 @@ if __name__ == "__main__":
     if args.tune == True:
         os.environ["TUNE_MODE"] = "1"  # enable tune mode
 
-        transformer = CogVideoXTransformer3DModel.from_pretrained(
+        transformer: CogVideoXTransformer3DModel = CogVideoXTransformer3DModel.from_pretrained(
             "THUDM/CogVideoX-2b",
             subfolder="transformer",
             torch_dtype=dtype_,
@@ -72,16 +90,19 @@ if __name__ == "__main__":
         ).to(device)
 
         pipe.enable_model_cpu_offload()
-
+        # 处理前 5 个提示就能够达到tune的目的了
         for i, prompt in tqdm(enumerate(prompts[:5])):
             video = pipe(
                 prompt.strip(),
+                # 每个提示生成 1 个视频
                 num_videos_per_prompt=1,
+                # 是dit
                 num_inference_steps=50,
                 num_frames=num_frames_,
+                # 控制生成结果多贴近提示
                 guidance_scale=6,
                 generator=torch.Generator(device="cuda").manual_seed(42),
-            ).frames[0]
+            ).frames[0] # 取生成的第一个视频，因为每个提示只生成一个视频
 
             del video
             gc.collect()
@@ -105,6 +126,7 @@ if __name__ == "__main__":
             saved_state_dict = torch.load(args.model_out_path)  
             load_sparse_attention_state_dict(transformer, saved_state_dict)
 
+        transformer.set_sparse_properties(use_kv_sparse=args.use_kv_sparse, num_evaluate_layer=args.num_evaluate_layer, kv_sparse_threshold=args.kv_sparse_threshold)
         pipe = CogVideoXPipeline.from_pretrained(
             "THUDM/CogVideoX-2b",
             transformer=transformer,
@@ -113,7 +135,8 @@ if __name__ == "__main__":
 
         if args.compile:
             pipe.transformer = torch.compile(pipe.transformer, mode="max-autotune-no-cudagraphs")
-
+        # 将 VAE（变分自编码器，处理图像/视频的组件）分片计算，减少内存占用
+        # 将大图像分成小块处理，进一步节省内存
         pipe.vae.enable_slicing()
         pipe.vae.enable_tiling()
 

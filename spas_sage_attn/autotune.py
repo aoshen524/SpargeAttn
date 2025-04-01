@@ -59,7 +59,7 @@ from tools.gpu_process import GPUProcessPoolExecutor
 executor = GPUProcessPoolExecutor()
 
 class SparseAttentionMeansim(nn.Module):
-    def __init__(self, sim_rule="l1", l1=0.07, pv_l1=0.08, cos_sim=0.98, rmse=0.07, rearrange_kwargs={}, tune_pv=True):
+    def __init__(self, sim_rule="l1", l1=0.07, pv_l1=0.08, cos_sim=0.98, rmse=0.07, rearrange_kwargs={}, tune_pv=True, layer_id=None):
         super(SparseAttentionMeansim, self).__init__()
         self.head_num = None
         assert l1 >= 0 and cos_sim <= 1 and rmse >= 0, "l1, cos_sim, rmse should be legal"
@@ -78,7 +78,9 @@ class SparseAttentionMeansim(nn.Module):
         self.sim_rule = sim_rule
         self.rearrange_kwargs = rearrange_kwargs
         self.tune_pv = tune_pv
-    
+        self.layer_id = layer_id
+        self.kernel = self.kernel_selection()
+
     def is_sim(self, o_gt, o_sparse):
         if self.sim_rule == "cosine":
             return precision_metric(o_sparse, o_gt, verbose=False)["Cossim"] > self.cos_sim
@@ -116,12 +118,14 @@ class SparseAttentionMeansim(nn.Module):
 
     def kernel_selection(self):
         sm = torch.cuda.get_device_capability()
-        sm = 10*sm[0] + sm[1]
+        sm = 10 * sm[0] + sm[1]
         if sm >= 89:
-            return spas_sage2_attn_meansim_cuda
+            kernel = spas_sage2_attn_meansim_cuda
+            return kernel
         else:
             warnings.warn(f'{sm=}, do not support sageattn2, using sageattn1 kernel')
-            return spas_sage_attn_meansim_cuda
+            kernel = spas_sage_attn_meansim_cuda
+            return kernel
 
     @torch.no_grad()
     def tune_pvthreshd(self, qi, ki, vi, mask=None, is_causal=False, smooth_k=True, simthreshd1=None, cdfthreshd=None):
@@ -162,8 +166,7 @@ class SparseAttentionMeansim(nn.Module):
         cur_cdfthreshd = 0.1
         delta = 0.001
         while cur_max_cdfthreshd - cur_min_cdfthreshd > delta:
-            kernel = self.kernel_selection()
-            sparse_i, sparsity = kernel(
+            sparse_i, sparsity = self.kernel(
                 qi,
                 ki,
                 vi,
@@ -237,7 +240,6 @@ class SparseAttentionMeansim(nn.Module):
         
         grid = partition_points_into_line(all_hyperparams, 2/granularity)
         groups = list(grid.values())
-        # sort by sum of sparsity, local smoothing
         groups = sorted(groups, key=lambda x: sum([y['sparsity'] for y in x]), reverse=True)
         final_group = groups[0]
         final_simthreshd1 = np.max([x['simthreshd1'] for x in final_group]).item()
@@ -261,23 +263,13 @@ class SparseAttentionMeansim(nn.Module):
         if not self.is_sparse[head_idx]:
             self.cdfthreshd[head_idx] = 1
             self.simthreshd1[head_idx] = 1
-        
+
     @torch.no_grad()
-    def forward(
-        self,
-        q,
-        k,
-        v,
-        mask=None,
-        is_causal=False,
-        tune_mode=False,
-        smooth_k=True,
-        return_sparsity=False,
-    ):
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask=None, is_causal=False, tune_mode=False, smooth_k=True, return_sparsity=False, return_sparse_table=False, kv_sparse_threshold=None):
         assert len(q.shape) == 4, "q should be 4-d tensor with B, H, L, D"
             
         if os.environ.get("TUNE_MODE", "") != "" or tune_mode:
-            if self.is_sparse is None:  # init per head hyper parameters
+            if self.is_sparse is None:
                 self.init_hyperparams(q.shape[1], q.device)
             if os.environ.get('PARALLEL_TUNE', '') == '':
                 for i in tqdm(range(self.head_num)):
@@ -298,18 +290,12 @@ class SparseAttentionMeansim(nn.Module):
                     rtdict = future.result()
                     self.fill_results(rtdict)
                     
-                
             self.num_data_passed += 1
-            print(f'{self.cdfthreshd=}')
-            print(f'{self.simthreshd1=}')
-            print(f'{self.is_sparse=}')
-            print(f'{self.pvthreshd=}')
-            o = F.scaled_dot_product_attention(q, k, v, mask, is_causal=is_causal)
+            o = torch.nn.functional.scaled_dot_product_attention(q, k, v, mask, is_causal=is_causal)
             torch.cuda.empty_cache()
         else:
             assert self.cdfthreshd is not None, "attention hyperparameters should be tuned first"
-            kernel = self.kernel_selection()
-            o = kernel(
+            outputs = self.kernel(
                 q,
                 k,
                 v,
@@ -321,10 +307,9 @@ class SparseAttentionMeansim(nn.Module):
                 pvthreshd=self.pvthreshd.float(),
                 return_sparsity=return_sparsity,
                 attention_sink= True,  # Only keep True when inference !!!!
+                return_sparse_table=return_sparse_table,
+                kv_sparse_threshold=kv_sparse_threshold,
             )
+            
         
-        if return_sparsity:
-            o, total_sparsity = o
-            return o, total_sparsity
-        else:
-            return o
+        return outputs

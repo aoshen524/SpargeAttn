@@ -1,5 +1,5 @@
 import torch
-from .utils import hyperparameter_check, get_block_map_meansim, get_block_map_meansim_fuse_quant
+from .utils import hyperparameter_check, get_block_map_meansim, get_block_map_meansim_fuse_quant, get_attn_qk_sparse_table_int8
 from .quant_per_block import per_block_int8, per_warp_int8
 
 
@@ -8,20 +8,19 @@ import spas_sage_attn._fused as fused
 
 
 @torch.compiler.disable
-def spas_sage_attn_meansim_cuda(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, smooth_k=True, simthreshd1=0.1, cdfthreshd=0.9, pvthreshd=20, attention_sink=False, tensor_layout="HND", output_dtype=torch.float16, return_sparsity=False):
+def spas_sage_attn_meansim_cuda(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, smooth_k=True, simthreshd1=0.1, cdfthreshd=0.9, pvthreshd=20, attention_sink=False, tensor_layout="HND", output_dtype=torch.float16, return_sparsity=False, return_sparse_table=True, kv_sparse_threshold=0.1):
     assert q.size(-2)>=128, "seq_len should be not less than 128."
 
     torch.cuda.set_device(v.device)
 
     dtype = q.dtype
-    if dtype == torch.float32 or dtype == torch.float16:
+    if dtype in (torch.float32, torch.float16):
         q, k, v = q.contiguous().to(torch.float16), k.contiguous().to(torch.float16), v.contiguous().to(torch.float16)
     else:
         q, k, v = q.contiguous().to(torch.bfloat16), k.contiguous().to(torch.bfloat16), v.contiguous().to(torch.float16)
 
     if smooth_k:
         km = k.mean(dim=-2, keepdim=True)
-        # k = k - km
     headdim = q.size(-1)
 
     lut, valid_block_num, q_int8, q_scale, k_int8, k_scale = get_block_map_meansim_fuse_quant(q, k, km, is_causal=is_causal, simthreshd1=simthreshd1, cdfthreshd=cdfthreshd, return_lut=True, attention_sink=attention_sink)  # 
@@ -35,16 +34,27 @@ def spas_sage_attn_meansim_cuda(q, k, v, attn_mask=None, dropout_p=0.0, is_causa
 
     _is_causal = 1 if is_causal else 0
     o = torch.empty_like(q)
-    qattn.qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_threshold(q_int8, k_int8, v, o, lut, valid_block_num, pvthreshd, q_scale, k_scale, 1, _is_causal, 1, scale, 0)
+
+    qattn.qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_threshold(
+        q_int8, k_int8, v, o, lut, valid_block_num, pvthreshd, q_scale, k_scale,
+        1, _is_causal, 1, scale, 0
+    )
+    outputs = {}
+    outputs["o"] = o
 
     if return_sparsity:
         if is_causal is False:
             qk_sparsity = 1 - (valid_block_num.float().sum()) / (lut.size(3) * lut.size(2) * lut.size(0) * lut.size(1))
         else:
             qk_sparsity = 1 - (valid_block_num.float().sum()) / ((lut.size(3) + 2) // 2 * lut.size(2) * lut.size(0) * lut.size(1))
-        return o, qk_sparsity.item()
-    else:
-        return o
+        outputs["qk_sparsity"] = qk_sparsity.item()
+
+    if return_sparse_table:
+        sparse_table = get_attn_qk_sparse_table_int8(q_int8, k_int8, scale, kv_sparse_threshold=kv_sparse_threshold)
+        outputs["sparse_table"] = sparse_table
+
+    return outputs
+
 
 @torch.compiler.disable
 def spas_sage2_attn_meansim_cuda(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, smooth_k=True, simthreshd1=0.1, cdfthreshd=0.9, pvthreshd=20, attention_sink=False, tensor_layout="HND", output_dtype=torch.float16, return_sparsity=False):
