@@ -341,7 +341,7 @@ def block_map_lut(block_map):
     return lut.to(torch.int32), valid_entry_num.to(torch.int32)
 
 
-def get_attn_qk_sparse_table_int8(Q, K, scale, kv_sparse_threshold):
+def get_attn_qk_sparse_table_int8_quant(Q, K, scale, kv_sparse_threshold):
     batchsize, num_heads, seq_length, head_size = Q.shape
     device = Q.device
     dtype = torch.float32
@@ -366,7 +366,7 @@ def get_attn_qk_sparse_table_int8(Q, K, scale, kv_sparse_threshold):
     sparse_table = sparse_table.mean(dim=1)
     
     # Convert to binary table: 0 if value <= kv_sparse_threshold, 1 otherwise
-    sparse_binary_table = (sparse_table > kv_sparse_threshold).to(torch.int8)
+    sparse_binary_table = (sparse_table > kv_sparse_threshold).to(dtype=torch.bfloat16)
     
     return sparse_binary_table
 

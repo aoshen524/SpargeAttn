@@ -1,5 +1,5 @@
 import torch
-from .utils import hyperparameter_check, get_block_map_meansim, get_block_map_meansim_fuse_quant, get_attn_qk_sparse_table_int8
+from .utils import hyperparameter_check, get_block_map_meansim, get_block_map_meansim_fuse_quant, get_attn_qk_sparse_table_int8_quant
 from .quant_per_block import per_block_int8, per_warp_int8
 
 
@@ -50,7 +50,7 @@ def spas_sage_attn_meansim_cuda(q, k, v, attn_mask=None, dropout_p=0.0, is_causa
         outputs["qk_sparsity"] = qk_sparsity.item()
 
     if return_sparse_table:
-        sparse_table = get_attn_qk_sparse_table_int8(q_int8, k_int8, scale, kv_sparse_threshold=kv_sparse_threshold)
+        sparse_table = get_attn_qk_sparse_table_int8_quant(q_int8, k_int8, scale, kv_sparse_threshold=kv_sparse_threshold)
         outputs["sparse_table"] = sparse_table
 
     return outputs

@@ -62,7 +62,7 @@ if __name__ == "__main__":
     os.makedirs(args.out_path, exist_ok=True)
 
     dtype_ = torch.bfloat16
-    num_frames_ = 49
+    num_frames_ = 2
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -125,8 +125,8 @@ if __name__ == "__main__":
             # load saved state_dict
             saved_state_dict = torch.load(args.model_out_path)  
             load_sparse_attention_state_dict(transformer, saved_state_dict)
-
-        transformer.set_sparse_properties(use_kv_sparse=args.use_kv_sparse, num_evaluate_layer=args.num_evaluate_layer, kv_sparse_threshold=args.kv_sparse_threshold)
+        if args.use_spas_sage_attn and args.use_kv_sparse:
+            transformer.set_sparse_properties(use_kv_sparse=args.use_kv_sparse, num_evaluate_layer=args.num_evaluate_layer, kv_sparse_threshold=args.kv_sparse_threshold)
         pipe = CogVideoXPipeline.from_pretrained(
             "THUDM/CogVideoX-2b",
             transformer=transformer,

@@ -120,35 +120,32 @@ class SageAttnCogVideoXAttnProcessor:
         Mask the key and value tensors based on the sparse table.
 
         Args:
-            key (torch.Tensor): Key tensor.
-            value (torch.Tensor): Value tensor.
-            sparse_table (torch.Tensor): Sparse table indicating which keys/values to keep.
+            key (torch.Tensor): Key tensor of shape [batch_size, num_heads, seq_len, head_size].
+            value (torch.Tensor): Value tensor of shape [batch_size, num_heads, seq_len, head_size].
+            sparse_table (torch.Tensor): Sparse table of shape [batch_size, seq_len], indicating which keys/values to keep.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Pruned key and value tensors.
         """
-        # Prune key and value based on sparse_table
-        # Original behavior: set to 0 where sparse_table is 0
-        # Expand sparse_table to broadcast across heads and head_size dimensions
-        # sparse_table shape: [batch_size, seq_len]
-        # key/value shape: [batch_size, num_heads, seq_len, head_size]
         batch_size, seq_len = sparse_table.shape
         batch_size_k, num_heads, seq_len_k, head_size = key.shape
-        
+
         # Verify compatible dimensions
         assert batch_size == batch_size_k, "Batch sizes must match"
         assert seq_len == seq_len_k, "Sequence lengths must match"
-        sparse_table_expanded = sparse_table.unsqueeze(1).unsqueeze(3)
+
+        # Expand sparse_table to match key/value tensor shape: [batch_size, 1, seq_len, 1]
+        expanded_sparse_table = sparse_table.unsqueeze(1).unsqueeze(-1)
+
+        # Broadcast expanded_sparse_table across num_heads and head_size dimensions
+        mask = expanded_sparse_table.expand(-1, num_heads, -1, head_size)
+
+        # Apply mask: positions where sparse_table == 0 are set to zero
+        masked_key = key * mask
+        masked_value = value * mask
+
+        return masked_key, masked_value
         
-        # Create mask: 1 where sparse_table is 1 (keep), 0 where sparse_table is 0 (prune)
-        mask = sparse_table_expanded.float()
-        
-        # Apply mask to key and value
-        key = key * mask
-        value = value * mask
-    
-        return key, value
-    
     def prune_kv(self, key: torch.Tensor, value: torch.Tensor, sparse_table: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len = sparse_table.shape
         batch_size_k, num_heads, seq_len_k, head_size = key.shape
