@@ -364,8 +364,16 @@ def get_attn_qk_sparse_table_int8_quant(Q, K, scale, kv_sparse_threshold):
     # Take mean across heads
     sparse_table = sparse_table.mean(dim=1)
     
-    # Convert to binary table: 0 if value <= kv_sparse_threshold, 1 otherwise
-    sparse_binary_table = (sparse_table > kv_sparse_threshold).to(dtype=torch.bfloat16)
+    # 初始化二值表，默认所有位置为 1（代表非零）
+    sparse_binary_table = torch.ones(batchsize, seq_length, device=device, dtype=torch.bfloat16)
+    
+    # 对每个样本对 seq_length 上的值进行升序排序，sorted_indices 保存排序后的索引
+    _, sorted_indices = torch.sort(sparse_table, dim=1, descending=False)
+    sparsity = 0.01
+    num_zero = max(1, int(seq_length * sparsity))
+    # 利用高级索引，将每个样本中 sorted_indices 前 num_zero 的位置置 0
+    row_indices = torch.arange(batchsize, device=device).unsqueeze(1).expand(-1, num_zero)
+    sparse_binary_table[row_indices, sorted_indices[:, :num_zero]] = 0
     
     return sparse_binary_table
 

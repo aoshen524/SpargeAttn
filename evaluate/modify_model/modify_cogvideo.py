@@ -77,8 +77,6 @@ class SageAttnCogVideoXAttnProcessor:
         # 执行注意力计算
         outputs = attn.inner_attention(query, key, value, is_causal=False, return_sparse_table=self.evaluate_mode, kv_sparse_threshold=self.kv_sparse_threshold)
         hidden_states = outputs["o"]
-        if self.use_kv_sparse and self.evaluate_mode:
-            sparse_table = outputs["sparse_table"]
 
         # 调整形状
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
@@ -97,7 +95,17 @@ class SageAttnCogVideoXAttnProcessor:
             "encoder_hidden_states": encoder_hidden_states,
         }
         if self.use_kv_sparse and self.evaluate_mode:
-            processor_outputs["sparse_table"] = sparse_table
+            processor_outputs["sparse_table"] = outputs["sparse_table"]
+            # 计算总的元素个数
+            total_elements = outputs["sparse_table"].numel()
+
+            # 计算其中0的个数，因为这里0代表稀疏（即低于 kv_sparse_threshold 的位置）
+            num_zeros = (outputs["sparse_table"] == 0).sum()
+
+            # 计算稀疏度，即0的比例
+            sparsity_ratio = num_zeros.float() / total_elements
+
+            print(f"Layer {self.idx}: Sparse table 稀疏度（0 的比例）: {sparsity_ratio.item() * 100:.2f}%")
         return processor_outputs
     
     def set_sparse_properties(
@@ -120,7 +128,7 @@ class SageAttnCogVideoXAttnProcessor:
 
     def mask_kv(self, key: torch.Tensor, value: torch.Tensor, sparse_table: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Mask the key and value tensors based on the sparse table.
+        Mask the key and value tensors based on the sparse table by directly setting masked positions to 0.
 
         Args:
             key (torch.Tensor): Key tensor of shape [batch_size, num_heads, seq_len, head_size].
@@ -137,17 +145,17 @@ class SageAttnCogVideoXAttnProcessor:
         assert batch_size == batch_size_k, "Batch sizes must match"
         assert seq_len == seq_len_k, "Sequence lengths must match"
 
-        # Expand sparse_table to match key/value tensor shape: [batch_size, 1, seq_len, 1]
+        # Expand sparse_table to match key/value tensor shape: shape becomes [batch_size, 1, seq_len, 1]
         expanded_sparse_table = sparse_table.unsqueeze(1).unsqueeze(-1)
 
         # Broadcast expanded_sparse_table across num_heads and head_size dimensions
         mask = expanded_sparse_table.expand(-1, num_heads, -1, head_size)
 
-        # Apply mask: positions where sparse_table == 0 are set to zero
-        masked_key = key * mask
-        masked_value = value * mask
+        # Apply mask: positions where mask == 0 are set to 0 using masked_fill
+        masked_key = key.masked_fill(mask == 0, 0)
+        masked_value = value.masked_fill(mask == 0, 0)
 
-        return masked_key, masked_value
+        return key, value
         
     def prune_kv(self, key: torch.Tensor, value: torch.Tensor, sparse_table: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len = sparse_table.shape
