@@ -7,10 +7,8 @@
             "request": "launch",
             "program": "${workspaceFolder}/evaluate/cogvideo_example.py",
             "args": [
-                "--use_spas_sage_attn",
                 "--model_out_path",
                 "evaluate/models_dict/CogVideoX-2b_0.06_0.07.pt",
-                "--use_kv_sparse"
             ],
             "console": "integratedTerminal",
             "justMyCode": false
