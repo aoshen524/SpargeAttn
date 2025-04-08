@@ -305,7 +305,6 @@ def get_block_map_meansim_fuse_quant(q, k, km=None, is_causal=False, BLKQ=128, B
         final_map = final_map * causal_mask[None, None, ...]
 
     if attention_sink:
-        # 将 k 的第一个块设为 1（表示需要计算）
         final_map[:, :, :, 0] = 1
     
     if not return_lut:

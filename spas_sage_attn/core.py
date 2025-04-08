@@ -14,13 +14,14 @@ def spas_sage_attn_meansim_cuda(q, k, v, attn_mask=None, dropout_p=0.0, is_causa
     torch.cuda.set_device(v.device)
 
     dtype = q.dtype
-    if dtype in (torch.float32, torch.float16):
+    if dtype == torch.float32 or dtype == torch.float16:
         q, k, v = q.contiguous().to(torch.float16), k.contiguous().to(torch.float16), v.contiguous().to(torch.float16)
     else:
         q, k, v = q.contiguous().to(torch.bfloat16), k.contiguous().to(torch.bfloat16), v.contiguous().to(torch.float16)
 
     if smooth_k:
         km = k.mean(dim=-2, keepdim=True)
+        # k = k - km
     headdim = q.size(-1)
 
     lut, valid_block_num, q_int8, q_scale, k_int8, k_scale = get_block_map_meansim_fuse_quant(q, k, km, is_causal=is_causal, simthreshd1=simthreshd1, cdfthreshd=cdfthreshd, return_lut=True, attention_sink=attention_sink)  # 
@@ -34,11 +35,7 @@ def spas_sage_attn_meansim_cuda(q, k, v, attn_mask=None, dropout_p=0.0, is_causa
 
     _is_causal = 1 if is_causal else 0
     o = torch.empty_like(q)
-
-    qattn.qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_threshold(
-        q_int8, k_int8, v, o, lut, valid_block_num, pvthreshd, q_scale, k_scale,
-        1, _is_causal, 1, scale, 0
-    )
+    qattn.qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_threshold(q_int8, k_int8, v, o, lut, valid_block_num, pvthreshd, q_scale, k_scale, 1, _is_causal, 1, scale, 0)
     outputs = {}
     outputs["o"] = o
 
@@ -48,7 +45,7 @@ def spas_sage_attn_meansim_cuda(q, k, v, attn_mask=None, dropout_p=0.0, is_causa
         else:
             qk_sparsity = 1 - (valid_block_num.float().sum()) / ((lut.size(3) + 2) // 2 * lut.size(2) * lut.size(0) * lut.size(1))
         outputs["qk_sparsity"] = qk_sparsity.item()
-
+        
     if return_sparse_table:
         sparse_table = get_attn_qk_sparse_table_int8_quant(q_int8, k_int8, scale, kv_sparse_threshold=kv_sparse_threshold)
         outputs["sparse_table"] = sparse_table

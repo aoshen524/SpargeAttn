@@ -7,6 +7,7 @@ from diffusers.models.attention_processor import Attention
 from diffusers.models import CogVideoXTransformer3DModel
 from spas_sage_attn.autotune import SparseAttentionMeansim, extract_sparse_attention_state_dict, load_sparse_attention_state_dict
 
+
 class SageAttnCogVideoXAttnProcessor:
     r"""
     Processor for implementing scaled dot-product attention for the CogVideoX model. It applies a rotary embedding on
@@ -49,20 +50,19 @@ class SageAttnCogVideoXAttnProcessor:
         inner_dim = key.shape[-1]
         head_dim = inner_dim // attn.heads
 
-        # 调整 query, key, value 的形状并转置
         query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
-        # 应用规范化（如果存在）
         if attn.norm_q is not None:
             query = attn.norm_q(query)
         if attn.norm_k is not None:
             key = attn.norm_k(key)
 
-        # 应用 RoPE（旋转位置编码）
+        # Apply RoPE if needed
         if image_rotary_emb is not None:
             from diffusers.models.embeddings import apply_rotary_emb
+
             query[:, :, text_seq_length:] = apply_rotary_emb(query[:, :, text_seq_length:], image_rotary_emb)
             if not attn.is_cross_attention:
                 key[:, :, text_seq_length:] = apply_rotary_emb(key[:, :, text_seq_length:], image_rotary_emb)
@@ -80,11 +80,11 @@ class SageAttnCogVideoXAttnProcessor:
         # 调整形状
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
 
-        # 线性投影和 dropout
+        # linear proj
         hidden_states = attn.to_out[0](hidden_states)
+        # dropout
         hidden_states = attn.to_out[1](hidden_states)
 
-        # 分割 hidden_states 和 encoder_hidden_states
         encoder_hidden_states, hidden_states = hidden_states.split(
             [text_seq_length, hidden_states.size(1) - text_seq_length], dim=1
         )
@@ -177,7 +177,6 @@ class SageAttnCogVideoXAttnProcessor:
         value = torch.stack(value_pruned)  # [batch_size, num_heads, new_seq_len, head_size]
 
         return key, value
-
 
 def set_spas_sage_attn_cogvideox(
     model: CogVideoXTransformer3DModel,

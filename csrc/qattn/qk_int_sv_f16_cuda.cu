@@ -46,7 +46,8 @@ template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint3
         bool use_inst_buffer = false, PVThresholdMode pv_threashold_mode, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool return_pv_count = false>
 __global__ void qk_int_sv_f16_block_sparse_attn_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K, half *__restrict__ V, DTypeOut *__restrict__ O, int32_t *__restrict__ PV_Count, int32_t *__restrict__ Lut, int32_t *__restrict__ Valid_Block_Num, float *__restrict__ PV_Threshold,
                       float *__restrict__ Q_scale, float *__restrict__ K_scale,
-                      const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups, // 1
+                       // num_kv_groups = 1
+                      const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
                       const uint32_t stride_bz_q, const uint32_t stride_seq_q, const uint32_t stride_h_q,
                       const uint32_t stride_bz_k, const uint32_t stride_seq_k, const uint32_t stride_h_k,
                       const uint32_t stride_bz_v, const uint32_t stride_seq_v, const uint32_t stride_h_v,
@@ -58,7 +59,7 @@ __global__ void qk_int_sv_f16_block_sparse_attn_kernel(int8_t *__restrict__ Q, i
   static_assert(Q_GRAN == QuantGranularity::kPerBlock || Q_GRAN == QuantGranularity::kPerWarp || Q_GRAN == QuantGranularity::kPerThread, "Q_GRAN must be kPerBlock, kPerWarp or kPerThread");
   static_assert(K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp || K_GRAN == QuantGranularity::kPerThread, "K_GRAN must be kPerBlock, kPerWarp or kPerThread");
   static_assert(std::is_same<DTypeOut, half>::value || std::is_same<DTypeOut, nv_bfloat16>::value, "DTypeOut must be half or nv_bfloat16");
-  static_assert(head_dim % 64 == 0, "head_dim must be a multiple of 64"); // 64
+  static_assert(head_dim % 64 == 0, "head_dim must be a multiple of 64");
   static_assert(CTA_Q / CTA_K <= 2); // for efficient causal implementation
 
   using DTypeOut2 = typename std::conditional<std::is_same<DTypeOut, half>::value, half2, nv_bfloat162>::type;
@@ -164,8 +165,8 @@ __global__ void qk_int_sv_f16_block_sparse_attn_kernel(int8_t *__restrict__ Q, i
     }
   }
 
-  constexpr uint32_t K_smem_idx_offset = CTA_Q; // 128
-  constexpr uint32_t V_smem_idx_offset = CTA_Q + CTA_K; // 128 + 64 = 192
+  constexpr uint32_t K_smem_idx_offset = CTA_Q;
+  constexpr uint32_t V_smem_idx_offset = CTA_Q + CTA_K;
 
   constexpr SwizzleMode swizzle_mode_QK = (QK_SMEM_STRIDE == 32) ? SwizzleMode::k32B : (QK_SMEM_STRIDE == 64) ? SwizzleMode::k64B : SwizzleMode::k128B;
   smem_t<swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK> smem_Q(smem);
@@ -1038,7 +1039,7 @@ torch::Tensor qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_thresh
                                                           mask_mode, RETURN_PV_COUNT>;
 
             cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
-            // 17776 / 128, 64, 2
+
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
             // 32, 4 * 1
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));

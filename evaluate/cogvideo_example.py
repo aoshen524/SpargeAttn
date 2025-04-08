@@ -22,7 +22,6 @@ def parse_args():
     parser.add_argument(
         "--use_spas_sage_attn", action="store_true", help="Use Sage Attention"
     )
-    # verbose 控制是否打印详细信息
     parser.add_argument("--verbose", action="store_true", help="Verbose")
     parser.add_argument(
         "--out_path",
@@ -94,7 +93,6 @@ if __name__ == "__main__":
         for i, prompt in tqdm(enumerate(prompts[:5])):
             video = pipe(
                 prompt.strip(),
-                # 每个提示生成 1 个视频
                 num_videos_per_prompt=1,
                 # 是dit
                 num_inference_steps=50,
@@ -102,7 +100,7 @@ if __name__ == "__main__":
                 # 控制生成结果多贴近提示
                 guidance_scale=6,
                 generator=torch.Generator(device="cuda").manual_seed(42),
-            ).frames[0] # 取生成的第一个视频，因为每个提示只生成一个视频
+            ).frames[0]
 
             del video
             gc.collect()

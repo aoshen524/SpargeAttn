@@ -6,4 +6,4 @@ spas_sage_attn.egg-info
 *.so
 .DS_Store
 
-evaluate/
+evaluate/results/*

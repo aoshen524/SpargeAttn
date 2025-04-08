@@ -240,6 +240,7 @@ class SparseAttentionMeansim(nn.Module):
         
         grid = partition_points_into_line(all_hyperparams, 2/granularity)
         groups = list(grid.values())
+        # sort by sum of sparsity, local smoothing
         groups = sorted(groups, key=lambda x: sum([y['sparsity'] for y in x]), reverse=True)
         final_group = groups[0]
         final_simthreshd1 = np.max([x['simthreshd1'] for x in final_group]).item()
@@ -265,11 +266,23 @@ class SparseAttentionMeansim(nn.Module):
             self.simthreshd1[head_idx] = 1
 
     @torch.no_grad()
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask=None, is_causal=False, tune_mode=False, smooth_k=True, return_sparsity=False, return_sparse_table=False, kv_sparse_threshold=None):
+    def forward(
+        self,
+        q,
+        k,
+        v,
+        mask=None,
+        is_causal=False,
+        tune_mode=False,
+        smooth_k=True,
+        return_sparsity=False,
+        return_sparse_table=False, 
+        kv_sparse_threshold=None
+    ):
         assert len(q.shape) == 4, "q should be 4-d tensor with B, H, L, D"
             
         if os.environ.get("TUNE_MODE", "") != "" or tune_mode:
-            if self.is_sparse is None:
+            if self.is_sparse is None:  # init per head hyper parameters
                 self.init_hyperparams(q.shape[1], q.device)
             if os.environ.get('PARALLEL_TUNE', '') == '':
                 for i in tqdm(range(self.head_num)):
@@ -290,8 +303,13 @@ class SparseAttentionMeansim(nn.Module):
                     rtdict = future.result()
                     self.fill_results(rtdict)
                     
+                
             self.num_data_passed += 1
-            o = torch.nn.functional.scaled_dot_product_attention(q, k, v, mask, is_causal=is_causal)
+            print(f'{self.cdfthreshd=}')
+            print(f'{self.simthreshd1=}')
+            print(f'{self.is_sparse=}')
+            print(f'{self.pvthreshd=}')
+            o = F.scaled_dot_product_attention(q, k, v, mask, is_causal=is_causal)
             torch.cuda.empty_cache()
         else:
             assert self.cdfthreshd is not None, "attention hyperparameters should be tuned first"
