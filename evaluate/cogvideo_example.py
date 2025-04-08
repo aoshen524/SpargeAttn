@@ -138,7 +138,7 @@ if __name__ == "__main__":
         pipe.vae.enable_slicing()
         pipe.vae.enable_tiling()
 
-        for i, prompt in tqdm(enumerate(prompts)):
+        for i, prompt in tqdm(enumerate(prompts[0:1])):
             video = pipe(
                 prompt.strip(),
                 num_videos_per_prompt=1,
