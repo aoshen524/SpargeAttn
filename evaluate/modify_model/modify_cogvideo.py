@@ -16,6 +16,9 @@ class SageAttnCogVideoXAttnProcessor:
 
     def __init__(self, idx, ):
         self.idx = idx
+        self.use_kv_sparse = False
+        self.kv_sparse_threshold = 0
+        self.evaluate_mode = False
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("CogVideoXAttnProcessor requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
 
