@@ -17,7 +17,7 @@ class SageAttnCogVideoXAttnProcessor:
     def __init__(self, idx, ):
         self.idx = idx
         self.use_kv_sparse = False
-        self.kv_sparse_threshold = 0
+        self.kv_sparsity = 0.0
         self.evaluate_mode = False
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("CogVideoXAttnProcessor requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
@@ -75,7 +75,7 @@ class SageAttnCogVideoXAttnProcessor:
             key, value = self.mask_kv(key, value, sparse_table)
         
         # 执行注意力计算
-        outputs = attn.inner_attention(query, key, value, is_causal=False, return_sparse_table=self.evaluate_mode, kv_sparse_threshold=self.kv_sparse_threshold)
+        outputs = attn.inner_attention(query, key, value, is_causal=False, return_sparse_table=self.evaluate_mode, kv_sparsity=self.kv_sparsity)
         hidden_states = outputs["o"]
 
         # 调整形状
@@ -99,7 +99,7 @@ class SageAttnCogVideoXAttnProcessor:
             # 计算总的元素个数
             total_elements = outputs["sparse_table"].numel()
 
-            # 计算其中0的个数，因为这里0代表稀疏（即低于 kv_sparse_threshold 的位置）
+            # 计算其中0的个数，因为这里0代表稀疏（即低于 kv_sparsity 的位置）
             num_zeros = (outputs["sparse_table"] == 0).sum()
 
             # 计算稀疏度，即0的比例
@@ -111,7 +111,7 @@ class SageAttnCogVideoXAttnProcessor:
     def set_sparse_properties(
         self,
         use_kv_sparse: bool = False,
-        kv_sparse_threshold: float = 0.1,
+        kv_sparsity: float = 0.0,
         evaluate_mode: bool = False,
     ):
         """
@@ -119,11 +119,11 @@ class SageAttnCogVideoXAttnProcessor:
 
         Args:
             use_kv_sparse (bool): Whether to use key-value sparsity.
-            kv_sparse_threshold (float): Threshold for key-value sparsity.
+            kv_sparsity (float): Threshold for key-value sparsity.
             evaluate_mode (bool): Whether the model is in evaluation mode.
         """
         self.use_kv_sparse = use_kv_sparse
-        self.kv_sparse_threshold = kv_sparse_threshold
+        self.kv_sparsity = kv_sparsity
         self.evaluate_mode = evaluate_mode
 
     def mask_kv(self, key: torch.Tensor, value: torch.Tensor, sparse_table: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -154,8 +154,7 @@ class SageAttnCogVideoXAttnProcessor:
         # Apply mask: positions where mask == 0 are set to 0 using masked_fill
         masked_key = key.masked_fill(mask == 0, 0)
         masked_value = value.masked_fill(mask == 0, 0)
-
-        return key, value
+        return masked_key, masked_value
         
     def prune_kv(self, key: torch.Tensor, value: torch.Tensor, sparse_table: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len = sparse_table.shape

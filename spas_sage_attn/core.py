@@ -8,7 +8,7 @@ import spas_sage_attn._fused as fused
 
 
 @torch.compiler.disable
-def spas_sage_attn_meansim_cuda(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, smooth_k=True, simthreshd1=0.1, cdfthreshd=0.9, pvthreshd=20, attention_sink=False, tensor_layout="HND", output_dtype=torch.float16, return_sparsity=False, return_sparse_table=True, kv_sparse_threshold=0.1):
+def spas_sage_attn_meansim_cuda(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, smooth_k=True, simthreshd1=0.1, cdfthreshd=0.9, pvthreshd=20, attention_sink=False, tensor_layout="HND", output_dtype=torch.float16, return_sparsity=False, return_sparse_table=True, kv_sparsity=0.1):
     assert q.size(-2)>=128, "seq_len should be not less than 128."
 
     torch.cuda.set_device(v.device)
@@ -47,7 +47,7 @@ def spas_sage_attn_meansim_cuda(q, k, v, attn_mask=None, dropout_p=0.0, is_causa
         outputs["qk_sparsity"] = qk_sparsity.item()
         
     if return_sparse_table:
-        sparse_table = get_attn_qk_sparse_table_int8_quant(q_int8, k_int8, scale, kv_sparse_threshold=kv_sparse_threshold)
+        sparse_table = get_attn_qk_sparse_table_int8_quant(q_int8, k_int8, scale, kv_sparsity=kv_sparsity)
         outputs["sparse_table"] = sparse_table
 
     return outputs

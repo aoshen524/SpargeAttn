@@ -47,9 +47,9 @@ def parse_args():
         help="Number of layers to evaluate",
     )
     parser.add_argument(
-        "--kv_sparse_threshold",
+        "--kv_sparsity",
         type=float,
-        default=1.01,
+        default=0.1,
         help="Threshold for kv sparse attention",
     )
     args = parser.parse_args()
@@ -61,7 +61,7 @@ if __name__ == "__main__":
     os.makedirs(args.out_path, exist_ok=True)
 
     dtype_ = torch.bfloat16
-    num_frames_ = 2
+    num_frames_ = 1
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -124,7 +124,7 @@ if __name__ == "__main__":
             saved_state_dict = torch.load(args.model_out_path)  
             load_sparse_attention_state_dict(transformer, saved_state_dict)
         if args.use_spas_sage_attn and args.use_kv_sparse:
-            transformer.set_sparse_properties(use_kv_sparse=args.use_kv_sparse, num_evaluate_layer=args.num_evaluate_layer, kv_sparse_threshold=args.kv_sparse_threshold)
+            transformer.set_sparse_properties(use_kv_sparse=args.use_kv_sparse, num_evaluate_layer=args.num_evaluate_layer, kv_sparsity=args.kv_sparsity)
         pipe = CogVideoXPipeline.from_pretrained(
             "THUDM/CogVideoX-2b",
             transformer=transformer,

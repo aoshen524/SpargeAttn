@@ -277,7 +277,7 @@ class SparseAttentionMeansim(nn.Module):
         smooth_k=True,
         return_sparsity=False,
         return_sparse_table=False, 
-        kv_sparse_threshold=None
+        kv_sparsity=None
     ):
         assert len(q.shape) == 4, "q should be 4-d tensor with B, H, L, D"
             
@@ -326,8 +326,7 @@ class SparseAttentionMeansim(nn.Module):
                 return_sparsity=return_sparsity,
                 attention_sink= True,  # Only keep True when inference !!!!
                 return_sparse_table=return_sparse_table,
-                kv_sparse_threshold=kv_sparse_threshold,
+                kv_sparsity=kv_sparsity,
             )
-            
-        
+
         return outputs

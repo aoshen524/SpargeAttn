@@ -340,7 +340,7 @@ def block_map_lut(block_map):
     return lut.to(torch.int32), valid_entry_num.to(torch.int32)
 
 
-def get_attn_qk_sparse_table_int8_quant(Q, K, scale, kv_sparse_threshold):
+def get_attn_qk_sparse_table_int8_quant(Q, K, scale, kv_sparsity):
     batchsize, num_heads, seq_length, head_size = Q.shape
     device = Q.device
     dtype = torch.float32
@@ -369,8 +369,7 @@ def get_attn_qk_sparse_table_int8_quant(Q, K, scale, kv_sparse_threshold):
     
     # 对每个样本对 seq_length 上的值进行升序排序，sorted_indices 保存排序后的索引
     _, sorted_indices = torch.sort(sparse_table, dim=1, descending=False)
-    sparsity = 0.01
-    num_zero = max(1, int(seq_length * sparsity))
+    num_zero = max(1, int(seq_length * kv_sparsity))
     # 利用高级索引，将每个样本中 sorted_indices 前 num_zero 的位置置 0
     row_indices = torch.arange(batchsize, device=device).unsqueeze(1).expand(-1, num_zero)
     sparse_binary_table[row_indices, sorted_indices[:, :num_zero]] = 0
